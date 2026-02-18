@@ -1,0 +1,13 @@
+FROM python:3.11-slim
+
+RUN pip install --no-cache-dir anki
+
+RUN mkdir -p /data
+
+ENV SYNC_BASE=/data
+ENV SYNC_HOST=0.0.0.0
+ENV SYNC_PORT=8080
+
+EXPOSE 8080
+
+CMD ["python", "-m", "anki.syncserver"]

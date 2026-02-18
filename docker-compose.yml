@@ -1,0 +1,24 @@
+services:
+  anki-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data/mcp:/data
+    env_file: .env
+    depends_on:
+      - anki-sync
+    restart: unless-stopped
+
+  anki-sync:
+    build:
+      context: .
+      dockerfile: Dockerfile.syncserver
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data/sync:/data
+    env_file: .env
+    restart: unless-stopped
