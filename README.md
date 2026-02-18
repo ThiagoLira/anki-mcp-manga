@@ -1,12 +1,163 @@
 # Anki MCP
 
-Headless Anki MCP server that runs in Docker, lets Claude Web create Japanese vocabulary flashcards (from manga panels), and syncs them to all devices via a self-hosted Anki sync server.
+Headless Anki MCP server that runs in Docker, lets Claude create Japanese vocabulary flashcards (from manga panels), and syncs them to all devices via a self-hosted Anki sync server.
+
+## Card Types
+
+Two straightforward card types matching standard Anki study patterns:
+
+**Kanji cards** (deck: `Japones KANJI`) — for kanji and vocabulary:
+- Front: the kanji or word
+- Back: reading (hiragana) + meaning
+
+**Manga vocab cards** (deck: `Japones Vocab Mangas`) — for vocabulary from manga:
+- Front: the Japanese word + a screenshot of the manga panel
+- Back: translation of the full sentence from the panel
+
+## Quick Start (Local with Claude Code)
+
+### 1. Clone and configure
+
+```bash
+git clone https://github.com/ThiagoLira/anki-mcp-manga.git
+cd anki-mcp-manga
+
+cp .env.example .env
+# Edit .env — at minimum set MCP_AUTH_TOKEN to something strong:
+python3 -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+### 2. Start the stack
+
+```bash
+# Docker
+docker compose up --build -d
+
+# Or Podman
+podman compose up --build -d
+```
+
+This starts two containers:
+- **anki-mcp** (:8000) — the MCP server
+- **anki-sync** (:8080) — the Anki sync server
+
+### 3. Connect Claude Code
+
+Create `.mcp.json` in the project root (gitignored):
+
+```json
+{
+  "mcpServers": {
+    "anki": {
+      "type": "http",
+      "url": "http://localhost:8000/mcp",
+      "headers": {
+        "Authorization": "Bearer YOUR_TOKEN_HERE"
+      }
+    }
+  }
+}
+```
+
+Start a new Claude Code session in this directory. It will connect to the MCP server and have access to all the Anki tools.
+
+### 4. Test it
+
+Ask Claude Code to:
+- `"list my anki decks"`
+- `"create a kanji card for 食べる (たべる, to eat)"`
+- `"sync to server"`
+
+## Expose to Claude Web (Tailscale Funnel)
+
+To use this from Claude Web (claude.ai), you need to expose the MCP server over HTTPS. Tailscale Funnel does this with automatic TLS certificates.
+
+### 1. Install Tailscale
+
+See [tailscale.com/download](https://tailscale.com/download).
+
+### 2. Enable Funnel
+
+```bash
+sudo tailscale funnel 8000
+```
+
+This maps `https://<machine>.<tailnet>.ts.net/` to `localhost:8000`.
+
+### 3. Add connector in Claude Web
+
+Go to [claude.ai/settings/integrations](https://claude.ai/settings/integrations):
+1. Click **Add more integrations** → **Custom integration**
+2. **Name**: `Anki`
+3. **URL**: `https://<machine>.<tailnet>.ts.net/mcp`
+4. **Authentication**: Bearer Token → paste your `MCP_AUTH_TOKEN`
+
+Claude Web can now create flashcards directly in conversation.
+
+### 4. Point Anki clients at the sync server
+
+On your phone/desktop Anki (must be on the same Tailscale network):
+- **Preferences → Syncing → Self-hosted sync server**
+- URL: `http://<machine>.<tailnet>.ts.net:8080` or `http://100.x.x.x:8080`
+- Username/password: from your `.env` (`SYNC_USER` / `SYNC_PASSWORD`)
+
+## Data Management
+
+### Where data lives
+
+```
+data/
+├── mcp/                    ← MCP server's Anki collection
+│   ├── collection.anki2
+│   └── collection.media/   ← images (manga panels, etc.)
+└── sync/                   ← Sync server's data
+    └── user/
+```
+
+The `data/` directory is gitignored. This is the only state you need to back up.
+
+### Import your existing Anki collection
+
+If you already have an Anki collection you want to use:
+
+```bash
+# Stop the MCP container first
+docker compose stop anki-mcp
+
+# Copy your collection
+cp ~/.local/share/Anki2/User\ 1/collection.anki2 data/mcp/
+cp -a ~/.local/share/Anki2/User\ 1/collection.media/. data/mcp/collection.media/
+
+# Restart
+docker compose start anki-mcp
+```
+
+Then call `sync_to_server` from Claude to push it to the sync server.
+
+### Sync workflow
+
+```
+Claude creates card → MCP server adds to local collection
+                    → call sync_to_server
+                    → pushes to self-hosted sync server
+                    → phone/desktop Anki syncs from same server
+```
+
+After creating cards, always call `sync_to_server` to push changes. When Anki desktop syncs, if there's a conflict, choose **"Download from server"** to get the MCP's cards.
+
+### Backup
+
+Just back up the `data/` directory. Or rely on the sync server — any Anki client pointed at it has a full copy.
+
+### Migration back to AnkiWeb
+
+1. Open Anki desktop
+2. Remove the custom sync server URL from preferences
+3. Sync to AnkiWeb — choose **"Upload to AnkiWeb"**
 
 ## Architecture
 
 ### Network Topology
-
-How requests flow from Claude Web to your Anki devices:
 
 ```mermaid
 graph LR
@@ -54,8 +205,6 @@ graph LR
 
 ### Module Dependency Graph
 
-How the Python modules import each other:
-
 ```mermaid
 graph TD
     SERVER["server.py<br/><i>FastMCP entry point</i><br/><i>8 tool definitions</i>"]
@@ -77,150 +226,85 @@ graph TD
     SM -.->|"TYPE_CHECKING only"| AM
 ```
 
-### Card Creation Flows
-
-#### Kanji card — `create_kanji_card`
+### Card Creation Flow (Kanji)
 
 ```mermaid
 sequenceDiagram
-    participant C as Claude Web
-    participant A as BearerAuthMiddleware
+    participant C as Claude
+    participant A as Auth Middleware
     participant M as FastMCP Server
     participant AM as AnkiManager
-    participant NT as note_templates
     participant COL as Collection (.anki2)
 
     C->>A: POST /mcp (Bearer token)
-    A->>A: Validate token
     A->>M: Forward request
-
-    M->>AM: create_kanji_card(<br/>kanji, reading, meaning, tags)
-
-    AM->>COL: Lazy open Collection(path)
-    AM->>NT: ensure_kanji_notetype(col)
-    NT->>COL: models.by_name("Kanji")
-
-    alt Notetype doesn't exist
-        NT->>COL: models.new() + add 3 fields<br/>(Kanji, Reading, Meaning)
-        NT->>COL: add Card 1 template
-        NT->>COL: models.add(notetype)
-    end
-
-    NT-->>AM: notetype dict
-
+    M->>AM: create_kanji_card(kanji, reading, meaning, tags)
+    AM->>COL: ensure_kanji_notetype(col)
     AM->>COL: decks.id("Japones KANJI")
-    AM->>COL: new_note(notetype)
-    AM->>AM: Set Kanji, Reading, Meaning
-
-    opt tags provided
-        AM->>AM: note.add_tag() for each
-    end
-
-    AM->>COL: col.add_note(note, deck_id)
-    AM-->>M: CardResult(note_id, front, deck)
+    AM->>COL: new_note → set fields → add_note
+    AM-->>M: CardResult
     M-->>C: {"status": "created", ...}
 ```
 
-#### Manga card — `create_manga_card`
+### Card Creation Flow (Manga)
 
 ```mermaid
 sequenceDiagram
-    participant C as Claude Web
-    participant A as BearerAuthMiddleware
+    participant C as Claude
+    participant A as Auth Middleware
     participant M as FastMCP Server
     participant AM as AnkiManager
-    participant NT as note_templates
     participant COL as Collection (.anki2)
     participant MEDIA as Media Folder
 
     C->>A: POST /mcp (Bearer token)
-    A->>A: Validate token
     A->>M: Forward request
-
-    M->>AM: create_manga_card(<br/>word, translation,<br/>image_base64, tags)
-
-    AM->>COL: Lazy open Collection(path)
-    AM->>NT: ensure_manga_notetype(col)
-    NT->>COL: models.by_name("Manga Vocab")
-
-    alt Notetype doesn't exist
-        NT->>COL: models.new() + add 3 fields<br/>(Word, Image, Translation)
-        NT->>COL: add Card 1 template
-        NT->>COL: models.add(notetype)
-    end
-
-    NT-->>AM: notetype dict
-
+    M->>AM: create_manga_card(word, translation, image_url, tags)
+    AM->>COL: ensure_manga_notetype(col)
     AM->>COL: decks.id("Japones Vocab Mangas")
-    AM->>COL: new_note(notetype)
-    AM->>AM: Set Word, Translation
 
-    opt image_base64 provided
-        AM->>AM: base64 decode → Pillow open
-        AM->>AM: Convert RGB, resize max 1024px
-        AM->>AM: Compress to WebP quality=80
-        AM->>MEDIA: col.media.write_data(<br/>anki_mcp_{hash}.webp)
-        AM->>AM: Image = &lt;img src="file.webp"&gt;
+    opt image_url provided
+        AM->>AM: Download image from URL
+        AM->>AM: Pillow: resize, compress to WebP
+        AM->>MEDIA: col.media.write_data(file.webp)
     end
 
-    opt tags provided
-        AM->>AM: note.add_tag() for each
-    end
-
-    AM->>COL: col.add_note(note, deck_id)
-    AM-->>M: CardResult(note_id, front, deck)
+    AM->>COL: new_note → set fields → add_note
+    AM-->>M: CardResult
     M-->>C: {"status": "created", ...}
 ```
 
 ### Sync Flow
 
-What happens when Claude calls `sync_to_server`:
-
 ```mermaid
 sequenceDiagram
-    participant C as Claude Web
+    participant C as Claude
     participant SM as SyncManager
     participant COL as Collection
     participant SS as Sync Server (:8080)
 
     C->>SM: sync_to_server()
-
     SM->>COL: sync_login(user, pass, endpoint)
     COL->>SS: Authenticate
-    SS-->>COL: SyncAuth (hkey + endpoint)
-
-    SM->>COL: sync_collection(auth, sync_media=False)
+    SM->>COL: sync_collection(auth)
     COL->>SS: Check sync state
-    SS-->>COL: SyncCollectionResponse(required)
 
-    alt required == NO_CHANGES (0)
-        SM->>SM: result = "no_changes"
-    else required == NORMAL_SYNC (1)
-        SM->>SM: result = "synced"
-    else required == FULL_UPLOAD (4)
+    alt NO_CHANGES
+        SM->>SM: Already up to date
+    else NORMAL_SYNC
+        SM->>SM: Incremental sync done
+    else FULL_UPLOAD / FULL_SYNC
         SM->>COL: full_upload_or_download(upload=True)
         COL->>SS: Push entire collection
-        SM->>COL: reopen(after_full_sync=True)
-    else required == FULL_DOWNLOAD (3)
-        SM->>COL: full_upload_or_download(upload=False)
-        COL->>SS: Pull entire collection
-        SM->>COL: reopen(after_full_sync=True)
-    else required == FULL_SYNC (2)
-        SM->>COL: full_upload_or_download(upload=True)
-        Note over SM: Ambiguous state:<br/>default to upload<br/>since MCP is the source
-        SM->>COL: reopen(after_full_sync=True)
+        SM->>SM: Close and reopen collection
     end
 
-    SM->>COL: sync_login() again<br/>(re-auth after potential reopen)
     SM->>COL: sync_media(auth)
-    COL->>SS: Push/pull media files (images)
-
+    COL->>SS: Push/pull media files
     SM-->>C: {"collection_sync": "...", "media_sync": "synced"}
 ```
 
 ### Card Types
-
-The two notetypes and the cards they produce:
 
 ```mermaid
 graph TD
@@ -288,22 +372,30 @@ graph LR
     T8 --> AM
 ```
 
-## Setup
+## Environment Variables
+
+| Variable | Description | Default |
+|---|---|---|
+| `MCP_AUTH_TOKEN` | Bearer token for MCP auth (required) | — |
+| `SYNC_USER` | Sync server username | `user` |
+| `SYNC_PASSWORD` | Sync server password | `password` |
+| `SYNC_ENDPOINT` | Sync server URL (internal) | `http://anki-sync:8080` |
+| `COLLECTION_PATH` | Path to collection inside container | `/data/collection.anki2` |
+| `KANJI_DECK` | Target deck for kanji cards | `Japones KANJI` |
+| `MANGA_DECK` | Target deck for manga cards | `Japones Vocab Mangas` |
+| `SYNC_USER1` | Sync server credentials (`user:pass`) | `user:password` |
+
+## Development
 
 ```bash
-cp .env.example .env
-# Edit .env with your values
-docker compose up -d
+# Create venv with Python 3.11 (required by anki package)
+uv venv --python 3.11 .venv
+source .venv/bin/activate
+uv pip install -e ".[dev]"
+
+# Run tests
+MCP_AUTH_TOKEN=test pytest tests/ -v
+
+# Run server locally (without Docker)
+MCP_AUTH_TOKEN=test python -m src.server
 ```
-
-### Tailscale Funnel
-
-```bash
-tailscale funnel --bg 8000
-```
-
-### Claude Web Connector
-
-Settings > Connectors > Add custom connector:
-- URL: `https://<machine>.ts.net/mcp`
-- Auth: Bearer token from `.env`
