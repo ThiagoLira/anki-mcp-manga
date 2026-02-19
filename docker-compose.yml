@@ -1,10 +1,8 @@
 services:
-  anki-mcp:
+  anki-bot:
     build:
       context: .
       dockerfile: Dockerfile
-    ports:
-      - "8000:8000"
     volumes:
       - ./data/mcp:/data
     env_file: .env

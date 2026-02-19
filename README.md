@@ -1,20 +1,56 @@
-# Anki MCP
+# Anki Telegram Bot
 
-Headless Anki MCP server that runs in Docker, lets Claude create Japanese vocabulary flashcards (from manga panels), and syncs them to all devices via a self-hosted Anki sync server.
+Telegram bot that creates Japanese vocabulary Anki flashcards from manga screenshots and text. Send a photo of a manga page and the bot extracts vocabulary, creates cards with the image, and syncs to all your devices.
+
+Powered by a LangGraph ReAct agent (via OpenRouter) and a headless Anki collection running in Docker.
 
 ## Card Types
 
-Two straightforward card types matching standard Anki study patterns:
-
-**Kanji cards** (deck: `Japones KANJI`) — for kanji and vocabulary:
-- Front: the kanji or word
+**Kanji cards** (deck: `Japones KANJI`):
+- Front: kanji or word
 - Back: reading (hiragana) + meaning
 
-**Manga vocab cards** (deck: `Japones Vocab Mangas`) — for vocabulary from manga:
-- Front: the Japanese word + a screenshot of the manga panel
-- Back: translation of the full sentence from the panel
+**Manga vocab cards** (deck: `Japones Vocab Mangas`):
+- Front: manga panel screenshot + Japanese sentence with the target word in **bold**
+- Back: full sentence translation with the target word in **bold**
 
-## Quick Start (Local with Claude Code)
+## Architecture
+
+```
+Telegram User
+    | photo + caption / text
+    v
++-----------------------------+
+|  anki-bot container         |
+|                             |
+|  aiogram (polling) ---------+--> Telegram API (outbound)
+|      |                      |
+|  LangGraph ReAct Agent -----+--> OpenRouter API (outbound)
+|      |                      |
+|  Anki Tools (direct calls)  |
+|      |                      |
+|  AnkiManager + SyncManager -+--> anki-sync:8080 (internal)
+|      |                      |
+|  /data (collection + media) |
++-----------------------------+
+
++-----------------------------+
+|  anki-sync container        |
+|  python -m anki.syncserver  |
+|  :8080 (Tailscale for       |
+|   phone/desktop clients)    |
++-----------------------------+
+```
+
+No inbound ports on the bot container. It uses Telegram polling (outbound only). The sync server is exposed to Tailscale for your phone/desktop Anki clients.
+
+## Setup
+
+### Prerequisites
+
+- Docker (or Podman)
+- A Telegram bot token (from [@BotFather](https://t.me/BotFather))
+- An [OpenRouter](https://openrouter.ai/) API key
 
 ### 1. Clone and configure
 
@@ -23,83 +59,69 @@ git clone https://github.com/ThiagoLira/anki-mcp-manga.git
 cd anki-mcp-manga
 
 cp .env.example .env
-# Edit .env — at minimum set MCP_AUTH_TOKEN to something strong:
-python3 -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+
+Edit `.env` and fill in the required values:
+
+```bash
+# Required: get this from @BotFather on Telegram
+TELEGRAM_BOT_TOKEN=your-bot-token-here
+
+# Required: get this from openrouter.ai/keys
+OPENROUTER_API_KEY=your-openrouter-key-here
+```
+
+#### Getting a Telegram bot token
+
+1. Open Telegram and message [@BotFather](https://t.me/BotFather)
+2. Send `/newbot`, pick a name and username
+3. Copy the token it gives you into `TELEGRAM_BOT_TOKEN`
+
+#### Restricting access (optional)
+
+To limit who can use the bot, set `ALLOWED_TELEGRAM_USER_IDS` to a comma-separated list of Telegram user IDs. Leave empty to allow anyone.
+
+To find your user ID, message [@userinfobot](https://t.me/userinfobot) on Telegram.
+
+```bash
+ALLOWED_TELEGRAM_USER_IDS=123456789,987654321
 ```
 
 ### 2. Start the stack
 
 ```bash
-# Docker
 docker compose up --build -d
-
-# Or Podman
-podman compose up --build -d
 ```
 
 This starts two containers:
-- **anki-mcp** (:8000) — the MCP server
-- **anki-sync** (:8080) — the Anki sync server
+- **anki-bot** -- the Telegram bot (no exposed ports)
+- **anki-sync** (:8080) -- self-hosted Anki sync server
 
-### 3. Connect Claude Code
-
-Create `.mcp.json` in the project root (gitignored):
-
-```json
-{
-  "mcpServers": {
-    "anki": {
-      "type": "http",
-      "url": "http://localhost:8000/mcp",
-      "headers": {
-        "Authorization": "Bearer YOUR_TOKEN_HERE"
-      }
-    }
-  }
-}
-```
-
-Start a new Claude Code session in this directory. It will connect to the MCP server and have access to all the Anki tools.
-
-### 4. Test it
-
-Ask Claude Code to:
-- `"list my anki decks"`
-- `"create a kanji card for 食べる (たべる, to eat)"`
-- `"sync to server"`
-
-## Expose to Claude Web (Tailscale Funnel)
-
-To use this from Claude Web (claude.ai), you need to expose the MCP server over HTTPS. Tailscale Funnel does this with automatic TLS certificates.
-
-### 1. Install Tailscale
-
-See [tailscale.com/download](https://tailscale.com/download).
-
-### 2. Enable Funnel
+Check the logs to confirm the bot started:
 
 ```bash
-sudo tailscale funnel 8000
+docker compose logs -f anki-bot
 ```
 
-This maps `https://<machine>.<tailnet>.ts.net/` to `localhost:8000`.
+### 3. Talk to the bot
 
-### 3. Add connector in Claude Web
+Open your bot in Telegram and try:
 
-Go to [claude.ai/settings/integrations](https://claude.ai/settings/integrations):
-1. Click **Add more integrations** → **Custom integration**
-2. **Name**: `Anki`
-3. **URL**: `https://<machine>.<tailnet>.ts.net/mcp`
-4. **Authentication**: Bearer Token → paste your `MCP_AUTH_TOKEN`
+- `/start` -- welcome message
+- `/stats` -- collection statistics
+- `/decks` -- list all decks
+- Send a text message like `"Create a card for 食べる (たべる, to eat)"` -- creates a kanji card and syncs
+- Send a manga screenshot -- the agent extracts vocabulary, creates manga vocab cards with the image, and syncs
 
-Claude Web can now create flashcards directly in conversation.
+### 4. Connect Anki clients to the sync server
 
-### 4. Point Anki clients at the sync server
+On your phone or desktop Anki (must be on the same network, or use Tailscale):
 
-On your phone/desktop Anki (must be on the same Tailscale network):
-- **Preferences → Syncing → Self-hosted sync server**
-- URL: `http://<machine>.<tailnet>.ts.net:8080` or `http://100.x.x.x:8080`
-- Username/password: from your `.env` (`SYNC_USER` / `SYNC_PASSWORD`)
+1. **Preferences > Syncing > Self-hosted sync server**
+2. URL: `http://<your-server-ip>:8080`
+3. Username / password: from your `.env` (`SYNC_USER` / `SYNC_PASSWORD`, default `user` / `password`)
+
+If you use Tailscale, the URL would be `http://100.x.x.x:8080` or `http://<machine>.<tailnet>.ts.net:8080`.
 
 ## Data Management
 
@@ -107,295 +129,62 @@ On your phone/desktop Anki (must be on the same Tailscale network):
 
 ```
 data/
-├── mcp/                    ← MCP server's Anki collection
-│   ├── collection.anki2
-│   └── collection.media/   ← images (manga panels, etc.)
-└── sync/                   ← Sync server's data
-    └── user/
+  mcp/                    <-- bot's Anki collection
+    collection.anki2
+    collection.media/     <-- images (manga panels as .webp)
+  sync/                   <-- sync server data
+    user/
 ```
 
 The `data/` directory is gitignored. This is the only state you need to back up.
 
-### Import your existing Anki collection
-
-If you already have an Anki collection you want to use:
+### Import an existing collection
 
 ```bash
-# Stop the MCP container first
-docker compose stop anki-mcp
+docker compose stop anki-bot
 
-# Copy your collection
 cp ~/.local/share/Anki2/User\ 1/collection.anki2 data/mcp/
 cp -a ~/.local/share/Anki2/User\ 1/collection.media/. data/mcp/collection.media/
 
-# Restart
-docker compose start anki-mcp
+docker compose start anki-bot
 ```
 
-Then call `sync_to_server` from Claude to push it to the sync server.
-
-### Sync workflow
-
-```
-Claude creates card → MCP server adds to local collection
-                    → call sync_to_server
-                    → pushes to self-hosted sync server
-                    → phone/desktop Anki syncs from same server
-```
-
-After creating cards, always call `sync_to_server` to push changes. When Anki desktop syncs, if there's a conflict, choose **"Download from server"** to get the MCP's cards.
-
-### Backup
-
-Just back up the `data/` directory. Or rely on the sync server — any Anki client pointed at it has a full copy.
+Then send any message to the bot so it triggers a sync, or restart the stack.
 
 ### Migration back to AnkiWeb
 
 1. Open Anki desktop
 2. Remove the custom sync server URL from preferences
-3. Sync to AnkiWeb — choose **"Upload to AnkiWeb"**
-
-## Architecture
-
-### Network Topology
-
-```mermaid
-graph LR
-    subgraph Internet
-        CW[Claude Web]
-    end
-
-    subgraph Tailscale Funnel
-        TF["HTTPS endpoint<br/>&lt;machine&gt;.ts.net/mcp"]
-    end
-
-    subgraph Docker Compose
-        subgraph anki-mcp ["anki-mcp container :8000"]
-            AUTH[BearerAuthMiddleware]
-            MCP[FastMCP Server]
-            AM[AnkiManager]
-            SM[SyncManager]
-            COL[(collection.anki2)]
-            MEDIA[(collection.media/)]
-        end
-
-        subgraph anki-sync ["anki-sync container :8080"]
-            SS[anki.syncserver]
-            SD[(sync data)]
-        end
-    end
-
-    subgraph Tailscale Mesh
-        PHONE[Phone Anki]
-        DESKTOP[Desktop Anki]
-    end
-
-    CW -->|"MCP over HTTP<br/>Bearer token"| TF
-    TF --> AUTH
-    AUTH --> MCP
-    MCP --> AM
-    MCP --> SM
-    AM --> COL
-    AM --> MEDIA
-    SM -->|"sync_login<br/>sync_collection<br/>sync_media"| SS
-    SS --> SD
-    PHONE -->|sync| SS
-    DESKTOP -->|sync| SS
-```
-
-### Module Dependency Graph
-
-```mermaid
-graph TD
-    SERVER["server.py<br/><i>FastMCP entry point</i><br/><i>8 tool definitions</i>"]
-    AUTH["auth.py<br/><i>BearerAuthMiddleware</i><br/><i>checks header + query param</i>"]
-    AM["anki_manager.py<br/><i>AnkiManager class</i><br/><i>create_kanji_card, create_manga_card</i>"]
-    SM["sync_manager.py<br/><i>SyncManager class</i><br/><i>sync orchestration</i>"]
-    NT["note_templates.py<br/><i>Kanji + Manga Vocab notetypes</i><br/><i>fields, CSS, card templates</i>"]
-    CFG["config.py<br/><i>Pydantic Settings</i><br/><i>reads .env</i>"]
-
-    SERVER --> AUTH
-    SERVER --> AM
-    SERVER --> SM
-    AM --> CFG
-    AM --> NT
-    SM --> CFG
-    AUTH --> CFG
-    NT --> ANKI["anki (pip)<br/><i>Collection, models,</i><br/><i>decks, media, sync</i>"]
-    AM --> ANKI
-    SM -.->|"TYPE_CHECKING only"| AM
-```
-
-### Card Creation Flow (Kanji)
-
-```mermaid
-sequenceDiagram
-    participant C as Claude
-    participant A as Auth Middleware
-    participant M as FastMCP Server
-    participant AM as AnkiManager
-    participant COL as Collection (.anki2)
-
-    C->>A: POST /mcp (Bearer token)
-    A->>M: Forward request
-    M->>AM: create_kanji_card(kanji, reading, meaning, tags)
-    AM->>COL: ensure_kanji_notetype(col)
-    AM->>COL: decks.id("Japones KANJI")
-    AM->>COL: new_note → set fields → add_note
-    AM-->>M: CardResult
-    M-->>C: {"status": "created", ...}
-```
-
-### Card Creation Flow (Manga)
-
-```mermaid
-sequenceDiagram
-    participant C as Claude
-    participant A as Auth Middleware
-    participant M as FastMCP Server
-    participant AM as AnkiManager
-    participant COL as Collection (.anki2)
-    participant MEDIA as Media Folder
-
-    C->>A: POST /mcp (Bearer token)
-    A->>M: Forward request
-    M->>AM: create_manga_card(word, translation, image_url, tags)
-    AM->>COL: ensure_manga_notetype(col)
-    AM->>COL: decks.id("Japones Vocab Mangas")
-
-    opt image_url provided
-        AM->>AM: Download image from URL
-        AM->>AM: Pillow: resize, compress to WebP
-        AM->>MEDIA: col.media.write_data(file.webp)
-    end
-
-    AM->>COL: new_note → set fields → add_note
-    AM-->>M: CardResult
-    M-->>C: {"status": "created", ...}
-```
-
-### Sync Flow
-
-```mermaid
-sequenceDiagram
-    participant C as Claude
-    participant SM as SyncManager
-    participant COL as Collection
-    participant SS as Sync Server (:8080)
-
-    C->>SM: sync_to_server()
-    SM->>COL: sync_login(user, pass, endpoint)
-    COL->>SS: Authenticate
-    SM->>COL: sync_collection(auth)
-    COL->>SS: Check sync state
-
-    alt NO_CHANGES
-        SM->>SM: Already up to date
-    else NORMAL_SYNC
-        SM->>SM: Incremental sync done
-    else FULL_UPLOAD / FULL_SYNC
-        SM->>COL: full_upload_or_download(upload=True)
-        COL->>SS: Push entire collection
-        SM->>SM: Close and reopen collection
-    end
-
-    SM->>COL: sync_media(auth)
-    COL->>SS: Push/pull media files
-    SM-->>C: {"collection_sync": "...", "media_sync": "synced"}
-```
-
-### Card Types
-
-```mermaid
-graph TD
-    subgraph KANJI_NT ["Kanji Notetype → deck: Japones KANJI"]
-        direction TB
-        K1["Kanji<br/><code>準</code>"]
-        K2["Reading<br/><code>じゅん</code>"]
-        K3["Meaning<br/><code>level, conform</code>"]
-    end
-
-    subgraph KANJI_CARD ["Card"]
-        direction TB
-        KF["<b>Front</b><br/>準"]
-        KB["<b>Back</b><br/>じゅん<br/>level, conform"]
-        KF --- KB
-    end
-
-    KANJI_NT --> KANJI_CARD
-
-    subgraph MANGA_NT ["Manga Vocab Notetype → deck: Japones Vocab Mangas"]
-        direction TB
-        M1["Word<br/><code>規則</code>"]
-        M2["Image<br/><code>&lt;img src=panel.webp&gt;</code>"]
-        M3["Translation<br/><code>You must follow the rules.</code>"]
-    end
-
-    subgraph MANGA_CARD ["Card"]
-        direction TB
-        MF["<b>Front</b><br/>規則<br/>+ manga panel screenshot"]
-        MB["<b>Back</b><br/>You must follow the rules."]
-        MF --- MB
-    end
-
-    MANGA_NT --> MANGA_CARD
-```
-
-### MCP Tools
-
-```mermaid
-graph LR
-    subgraph TOOLS ["Available MCP Tools"]
-        direction TB
-        T1["<b>create_kanji_card</b><br/>kanji, reading, meaning → Japones KANJI"]
-        T2["<b>create_manga_card</b><br/>word, image, translation → Japones Vocab Mangas"]
-        T3["<b>create_kanji_cards_batch</b><br/>Multiple kanji cards at once"]
-        T4["<b>create_manga_cards_batch</b><br/>Multiple manga cards at once"]
-        T5["<b>sync_to_server</b><br/>Push changes to sync server"]
-        T6["<b>list_decks</b><br/>All decks + note counts"]
-        T7["<b>search_notes</b><br/>Anki search syntax, max 50"]
-        T8["<b>get_collection_stats</b><br/>Notes, cards, decks, study"]
-    end
-
-    subgraph TARGET ["Backed by"]
-        AM["AnkiManager"]
-        SM["SyncManager"]
-    end
-
-    T1 --> AM
-    T2 --> AM
-    T3 --> AM
-    T4 --> AM
-    T5 --> SM
-    T6 --> AM
-    T7 --> AM
-    T8 --> AM
-```
+3. Sync to AnkiWeb -- choose "Upload to AnkiWeb"
 
 ## Environment Variables
 
-| Variable | Description | Default |
-|---|---|---|
-| `MCP_AUTH_TOKEN` | Bearer token for MCP auth (required) | — |
-| `SYNC_USER` | Sync server username | `user` |
-| `SYNC_PASSWORD` | Sync server password | `password` |
-| `SYNC_ENDPOINT` | Sync server URL (internal) | `http://anki-sync:8080` |
-| `COLLECTION_PATH` | Path to collection inside container | `/data/collection.anki2` |
-| `KANJI_DECK` | Target deck for kanji cards | `Japones KANJI` |
-| `MANGA_DECK` | Target deck for manga cards | `Japones Vocab Mangas` |
-| `SYNC_USER1` | Sync server credentials (`user:pass`) | `user:password` |
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `TELEGRAM_BOT_TOKEN` | yes | -- | Bot token from @BotFather |
+| `OPENROUTER_API_KEY` | yes | -- | OpenRouter API key |
+| `OPENROUTER_MODEL` | no | `anthropic/claude-sonnet-4` | LLM model to use |
+| `ALLOWED_TELEGRAM_USER_IDS` | no | (empty = allow all) | Comma-separated Telegram user IDs |
+| `SYNC_USER` | no | `user` | Sync server username |
+| `SYNC_PASSWORD` | no | `password` | Sync server password |
+| `SYNC_ENDPOINT` | no | `http://anki-sync:8080` | Sync server URL (internal) |
+| `COLLECTION_PATH` | no | `/data/collection.anki2` | Collection path inside container |
+| `KANJI_DECK` | no | `Japones KANJI` | Deck name for kanji cards |
+| `MANGA_DECK` | no | `Japones Vocab Mangas` | Deck name for manga vocab cards |
+| `SYNC_USER1` | no | `user:password` | Sync server credentials (`user:pass` format) |
 
 ## Development
 
 ```bash
-# Create venv with Python 3.11 (required by anki package)
+# Create venv (Python 3.11 required by anki package)
 uv venv --python 3.11 .venv
 source .venv/bin/activate
-uv pip install -e ".[dev]"
+uv sync --extra dev
 
 # Run tests
-MCP_AUTH_TOKEN=test pytest tests/ -v
+TELEGRAM_BOT_TOKEN=test OPENROUTER_API_KEY=test pytest tests/ -v
 
-# Run server locally (without Docker)
-MCP_AUTH_TOKEN=test python -m src.server
+# Run bot locally (without Docker)
+source .env
+python -m src.bot
 ```

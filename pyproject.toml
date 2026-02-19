@@ -1,13 +1,15 @@
 [project]
-name = "anki-mcp"
-version = "0.1.0"
-description = "Headless Anki MCP server for creating Japanese vocabulary flashcards"
+name = "anki-bot"
+version = "0.2.0"
+description = "Telegram bot with LangGraph agent for creating Japanese vocabulary Anki flashcards"
 requires-python = ">=3.11,<3.13"
 dependencies = [
-    "fastmcp>=2.0",
+    "aiogram>=3.10",
+    "langgraph>=0.2",
+    "langchain-openai>=0.2",
+    "Pillow>=10.0",
     "anki",
     "pydantic-settings>=2.0",
-    "uvicorn>=0.30",
 ]
 
 [project.optional-dependencies]

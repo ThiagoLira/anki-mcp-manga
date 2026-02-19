@@ -1,4 +1,7 @@
+import io
+
 import pytest
+from PIL import Image
 
 from src.anki_manager import AnkiManager
 from src.note_templates import (
@@ -21,6 +24,14 @@ def manager(col_path):
     m.close()
 
 
+def _make_test_png(width: int = 200, height: int = 100) -> bytes:
+    """Generate a small test PNG image."""
+    img = Image.new("RGB", (width, height), color=(255, 0, 0))
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
 class TestNoteTemplates:
     def test_ensure_kanji_notetype(self, manager):
         nt = ensure_kanji_notetype(manager.col)
@@ -35,9 +46,9 @@ class TestNoteTemplates:
         nt = ensure_manga_notetype(manager.col)
         assert nt["name"] == MANGA_NOTETYPE
         field_names = [f["name"] for f in nt["flds"]]
-        assert field_names == ["Word", "Translation"]
+        assert field_names == ["Word", "Sentence", "Image", "Translation"]
         assert len(nt["tmpls"]) == 1
-        assert "{{Word}}" in nt["tmpls"][0]["qfmt"]
+        assert "{{Sentence}}" in nt["tmpls"][0]["qfmt"]
         assert "{{Translation}}" in nt["tmpls"][0]["afmt"]
 
     def test_notetypes_idempotent(self, manager):
@@ -82,22 +93,29 @@ class TestKanjiCards:
 class TestMangaCards:
     def test_create_basic(self, manager):
         result = manager.create_manga_card(
-            word="規則", translation="Rules — 'You must follow the rules.'"
+            word="規則",
+            sentence="<b>規則</b>を守れ",
+            translation="Follow the <b>rules</b>",
         )
         assert result.front == "規則"
         assert result.note_id > 0
 
     def test_fields_stored(self, manager):
         result = manager.create_manga_card(
-            word="才能", translation="Talent — 'He has incredible talent.'"
+            word="才能",
+            sentence="彼は信じられない<b>才能</b>を持っている",
+            translation="He has incredible <b>talent</b>",
         )
         note = manager.col.get_note(result.note_id)
         assert note["Word"] == "才能"
-        assert note["Translation"] == "Talent — 'He has incredible talent.'"
+        assert "<b>才能</b>" in note["Sentence"]
+        assert "<b>talent</b>" in note["Translation"]
 
     def test_with_tags(self, manager):
         result = manager.create_manga_card(
-            word="一撃", translation="One strike — 'He defeated him in one strike.'",
+            word="一撃",
+            sentence="<b>一撃</b>で倒した",
+            translation="Defeated in <b>one strike</b>",
             tags=["one-punch-man"],
         )
         note = manager.col.get_note(result.note_id)
@@ -105,10 +123,44 @@ class TestMangaCards:
 
     def test_one_card_per_note(self, manager):
         result = manager.create_manga_card(
-            word="目立つ", translation="To stand out"
+            word="目立つ",
+            sentence="彼は<b>目立つ</b>存在だ",
+            translation="He is a presence that <b>stands out</b>",
         )
         note = manager.col.get_note(result.note_id)
         assert len(note.cards()) == 1
+
+    def test_create_with_image(self, manager):
+        image_data = _make_test_png()
+        result = manager.create_manga_card(
+            word="戦う",
+            sentence="<b>戦う</b>しかない",
+            translation="There's no choice but to <b>fight</b>",
+            image_data=image_data,
+        )
+        note = manager.col.get_note(result.note_id)
+        assert '<img src="manga_' in note["Image"]
+        assert note["Image"].endswith('.webp">')
+
+    def test_create_with_large_image_resized(self, manager):
+        image_data = _make_test_png(width=2048, height=1536)
+        result = manager.create_manga_card(
+            word="巨大",
+            sentence="<b>巨大</b>な敵が現れた",
+            translation="A <b>huge</b> enemy appeared",
+            image_data=image_data,
+        )
+        note = manager.col.get_note(result.note_id)
+        assert '<img src="manga_' in note["Image"]
+
+    def test_create_without_image(self, manager):
+        result = manager.create_manga_card(
+            word="静か",
+            sentence="<b>静か</b>にしろ",
+            translation="Be <b>quiet</b>",
+        )
+        note = manager.col.get_note(result.note_id)
+        assert note["Image"] == ""
 
 
 class TestCollectionOps:
@@ -126,7 +178,7 @@ class TestCollectionOps:
 
     def test_get_stats(self, manager):
         manager.create_kanji_card(kanji="火", reading="ひ", meaning="fire")
-        manager.create_manga_card(word="炎", translation="Flame")
+        manager.create_manga_card(word="炎", sentence="<b>炎</b>が燃えている", translation="The <b>flames</b> are burning")
         stats = manager.get_stats()
         assert stats["total_notes"] >= 2
         assert stats["total_cards"] >= 2

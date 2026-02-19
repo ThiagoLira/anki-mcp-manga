@@ -1,7 +1,10 @@
+import hashlib
+import io
 import os
 from dataclasses import dataclass
 
 from anki.collection import Collection
+from PIL import Image
 
 from .config import settings
 from .note_templates import ensure_kanji_notetype, ensure_manga_notetype
@@ -65,17 +68,28 @@ class AnkiManager:
     def create_manga_card(
         self,
         word: str,
+        sentence: str,
         translation: str,
+        image_data: bytes | None = None,
         tags: list[str] | None = None,
     ) -> CardResult:
-        """Create a manga vocab card. Front: word. Back: translation."""
+        """Create a manga vocab card.
+
+        Front: manga image + Japanese sentence (target word bolded).
+        Back: full sentence translation (target word bolded).
+        """
         col = self.col
         notetype = ensure_manga_notetype(col)
         deck_id = col.decks.id(settings.manga_deck)
 
         note = col.new_note(notetype)
         note["Word"] = word
+        note["Sentence"] = sentence
         note["Translation"] = translation
+
+        if image_data:
+            filename = self._process_image(image_data)
+            note["Image"] = f'<img src="{filename}">'
 
         if tags:
             for tag in tags:
@@ -83,6 +97,27 @@ class AnkiManager:
 
         col.add_note(note, deck_id)
         return CardResult(note_id=note.id, front=word, deck=settings.manga_deck)
+
+    def _process_image(self, image_data: bytes) -> str:
+        """Resize, convert to WebP, and save to collection media. Returns filename."""
+        img = Image.open(io.BytesIO(image_data))
+
+        if img.mode in ("RGBA", "P"):
+            img = img.convert("RGB")
+
+        max_dim = 1024
+        if max(img.size) > max_dim:
+            ratio = max_dim / max(img.size)
+            new_size = (int(img.width * ratio), int(img.height * ratio))
+            img = img.resize(new_size, Image.LANCZOS)
+
+        buf = io.BytesIO()
+        img.save(buf, format="WEBP", quality=80)
+        webp_bytes = buf.getvalue()
+
+        image_hash = hashlib.sha256(webp_bytes).hexdigest()[:12]
+        filename = f"manga_{image_hash}.webp"
+        return self.col.media.write_data(filename, webp_bytes)
 
     def list_decks(self) -> list[dict]:
         """List all decks with card counts."""
