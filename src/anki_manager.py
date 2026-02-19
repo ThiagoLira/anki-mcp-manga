@@ -1,5 +1,3 @@
-import base64
-import hashlib
 import os
 from dataclasses import dataclass
 
@@ -68,11 +66,9 @@ class AnkiManager:
         self,
         word: str,
         translation: str,
-        image_data: str | None = None,
-        image_url: str | None = None,
         tags: list[str] | None = None,
     ) -> CardResult:
-        """Create a manga vocab card. Front: word + manga panel. Back: translation."""
+        """Create a manga vocab card. Front: word. Back: translation."""
         col = self.col
         notetype = ensure_manga_notetype(col)
         deck_id = col.decks.id(settings.manga_deck)
@@ -81,56 +77,12 @@ class AnkiManager:
         note["Word"] = word
         note["Translation"] = translation
 
-        image_bytes = None
-        if image_data:
-            image_bytes = base64.b64decode(image_data)
-        elif image_url:
-            image_bytes = self._download_image(image_url)
-
-        if image_bytes:
-            image_hash = hashlib.sha256(image_bytes).hexdigest()[:12]
-            filename = f"anki_mcp_{image_hash}.webp"
-            saved = self._save_image(image_bytes, filename)
-            note["Image"] = f'<img src="{saved}">'
-
         if tags:
             for tag in tags:
                 note.add_tag(tag)
 
         col.add_note(note, deck_id)
         return CardResult(note_id=note.id, front=word, deck=settings.manga_deck)
-
-    def _download_image(self, url: str) -> bytes:
-        """Download an image from a URL. Returns raw bytes."""
-        import httpx
-
-        resp = httpx.get(url, follow_redirects=True, timeout=30)
-        resp.raise_for_status()
-        return resp.content
-
-    def _save_image(self, image_bytes: bytes, filename: str) -> str:
-        """Compress and save image to the collection media folder.
-
-        Converts to WebP for smaller file size. Returns the saved filename.
-        """
-        from PIL import Image
-        import io
-
-        img = Image.open(io.BytesIO(image_bytes))
-
-        if img.mode in ("RGBA", "P"):
-            img = img.convert("RGB")
-
-        # Resize if too large (max 1024px on longest side)
-        max_dim = 1024
-        if max(img.size) > max_dim:
-            ratio = max_dim / max(img.size)
-            new_size = (int(img.width * ratio), int(img.height * ratio))
-            img = img.resize(new_size, Image.LANCZOS)
-
-        buf = io.BytesIO()
-        img.save(buf, format="WEBP", quality=80)
-        return self.col.media.write_data(filename, buf.getvalue())
 
     def list_decks(self) -> list[dict]:
         """List all decks with card counts."""

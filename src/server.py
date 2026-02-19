@@ -19,10 +19,10 @@ For learning kanji and vocabulary words. Straightforward:
 Use create_kanji_card for these.
 
 ## Manga vocab cards (deck: Japones Vocab Mangas)
-For vocabulary learned from manga panels. Straightforward:
-- Front: the Japanese word + a screenshot of the manga panel
-- Back: translation of the full sentence from the panel
-Use create_manga_card for these. Always include the manga panel image when available.
+For vocabulary learned from manga/reading. Straightforward:
+- Front: the Japanese word
+- Back: translation of the full sentence where it appeared
+Use create_manga_card for these.
 
 After creating cards, call sync_to_server to push changes to the sync server.
 """,
@@ -58,16 +58,8 @@ def create_kanji_card(
 
 @mcp.tool()
 def create_manga_card(
-    word: str = Field(description="The Japanese word from the manga panel"),
-    translation: str = Field(description="Translation of the full sentence from the panel"),
-    image_base64: str | None = Field(
-        default=None,
-        description="Base64-encoded screenshot of the manga panel",
-    ),
-    image_url: str | None = Field(
-        default=None,
-        description="URL of the manga panel image (server downloads it directly)",
-    ),
+    word: str = Field(description="The Japanese word from the manga/reading"),
+    translation: str = Field(description="Translation of the full sentence where the word appeared"),
     tags: list[str] | None = Field(
         default=None,
         description='Optional tags (e.g. ["manga-title", "chapter-1"])',
@@ -75,12 +67,10 @@ def create_manga_card(
 ) -> dict:
     """Create a manga vocab flashcard in the Japones Vocab Mangas deck.
 
-    Front: word + manga panel screenshot. Back: sentence translation.
-    Provide image_url or image_base64 for the manga panel (URL preferred).
+    Front: word. Back: sentence translation.
     """
     result = manager.create_manga_card(
-        word=word, translation=translation,
-        image_data=image_base64, image_url=image_url, tags=tags,
+        word=word, translation=translation, tags=tags,
     )
     return {"status": "created", "note_id": result.note_id, "front": result.front}
 
@@ -93,10 +83,8 @@ class KanjiCardInput(BaseModel):
 
 
 class MangaCardInput(BaseModel):
-    word: str = Field(description="The Japanese word from the manga panel")
+    word: str = Field(description="The Japanese word from the manga/reading")
     translation: str = Field(description="Translation of the full sentence")
-    image_base64: str | None = None
-    image_url: str | None = None
     tags: list[str] | None = None
 
 
@@ -126,7 +114,6 @@ def create_manga_cards_batch(cards: list[MangaCardInput]) -> dict:
         try:
             result = manager.create_manga_card(
                 word=card.word, translation=card.translation,
-                image_data=card.image_base64, image_url=card.image_url,
                 tags=card.tags,
             )
             results.append({"note_id": result.note_id, "front": result.front})

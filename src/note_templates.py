@@ -33,12 +33,6 @@ CSS = """\
     color: #16213e;
     margin: 12px 0;
 }
-.image img {
-    max-width: 100%;
-    max-height: 300px;
-    border-radius: 8px;
-    margin: 12px 0;
-}
 .translation {
     font-size: 20px;
     color: #333;
@@ -67,16 +61,13 @@ KANJI_AFMT = """\
 """
 
 # --- Manga Vocab notetype ---
-# Front: manga panel screenshot + word
+# Front: word
 # Back: sentence translation
 
 MANGA_NOTETYPE = "Manga Vocab"
-MANGA_FIELDS = ["Word", "Image", "Translation"]
+MANGA_FIELDS = ["Word", "Translation"]
 
-MANGA_QFMT = """\
-<div class="word">{{Word}}</div>
-{{#Image}}<div class="image">{{Image}}</div>{{/Image}}
-"""
+MANGA_QFMT = '<div class="word">{{Word}}</div>'
 MANGA_AFMT = """\
 {{FrontSide}}
 <hr id="answer">

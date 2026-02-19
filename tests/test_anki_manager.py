@@ -1,8 +1,4 @@
-import base64
-import io
-
 import pytest
-from PIL import Image
 
 from src.anki_manager import AnkiManager
 from src.note_templates import (
@@ -25,13 +21,6 @@ def manager(col_path):
     m.close()
 
 
-def _make_test_image_b64() -> str:
-    img = Image.new("RGB", (10, 10), color="red")
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return base64.b64encode(buf.getvalue()).decode()
-
-
 class TestNoteTemplates:
     def test_ensure_kanji_notetype(self, manager):
         nt = ensure_kanji_notetype(manager.col)
@@ -46,7 +35,7 @@ class TestNoteTemplates:
         nt = ensure_manga_notetype(manager.col)
         assert nt["name"] == MANGA_NOTETYPE
         field_names = [f["name"] for f in nt["flds"]]
-        assert field_names == ["Word", "Image", "Translation"]
+        assert field_names == ["Word", "Translation"]
         assert len(nt["tmpls"]) == 1
         assert "{{Word}}" in nt["tmpls"][0]["qfmt"]
         assert "{{Translation}}" in nt["tmpls"][0]["afmt"]
@@ -105,16 +94,6 @@ class TestMangaCards:
         note = manager.col.get_note(result.note_id)
         assert note["Word"] == "才能"
         assert note["Translation"] == "Talent — 'He has incredible talent.'"
-
-    def test_with_image(self, manager):
-        b64 = _make_test_image_b64()
-        result = manager.create_manga_card(
-            word="猫", translation="Cat — 'The cat is sleeping.'",
-            image_data=b64,
-        )
-        note = manager.col.get_note(result.note_id)
-        assert "<img src=" in note["Image"]
-        assert ".webp" in note["Image"]
 
     def test_with_tags(self, manager):
         result = manager.create_manga_card(
