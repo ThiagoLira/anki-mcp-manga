@@ -4,7 +4,7 @@ from fastmcp import FastMCP
 from pydantic import BaseModel, Field
 
 from .anki_manager import AnkiManager
-from .auth import BearerAuthMiddleware
+from .config import settings
 from .sync_manager import SyncManager
 
 mcp = FastMCP(
@@ -166,10 +166,44 @@ def get_collection_stats() -> dict:
     return manager.get_stats()
 
 
+class SlashStripMiddleware:
+    """Strip trailing slashes from request paths to avoid 307 redirects."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope["path"].endswith("/") and scope["path"] != "/":
+            scope["path"] = scope["path"].rstrip("/")
+        await self.app(scope, receive, send)
+
+
 def create_app():
-    """Create the Starlette ASGI app with auth middleware."""
-    app = mcp.http_app()
-    app.add_middleware(BearerAuthMiddleware)
+    """Create the Starlette ASGI app with secret-path auth.
+
+    The MCP endpoint is mounted at /<token>/mcp/ — knowing the URL is the auth.
+    This works with Claude Web (no custom headers) and Claude Code alike.
+    """
+    from starlette.applications import Starlette
+    from starlette.middleware.cors import CORSMiddleware
+    from starlette.routing import Mount
+
+    mcp_app = mcp.http_app()
+    token = settings.mcp_auth_token
+    app = Starlette(
+        routes=[Mount(f"/{token}", app=mcp_app)],
+        lifespan=mcp_app.lifespan,
+    )
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+        expose_headers=["*"],
+    )
+    # Strip trailing slashes to avoid FastMCP's internal 307 redirects
+    # (which break behind TLS-terminating proxies like Tailscale Funnel)
+    app.add_middleware(SlashStripMiddleware)
     return app
 
 
