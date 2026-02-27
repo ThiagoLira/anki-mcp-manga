@@ -14,6 +14,7 @@ from .config import settings
 
 if TYPE_CHECKING:
     from .anki_manager import AnkiManager
+    from .panel_detector import PageAnalysis
     from .sync_manager import SyncManager
 
 logger = logging.getLogger(__name__)
@@ -30,7 +31,7 @@ Use create_kanji_card for individual cards, create_kanji_cards_batch for multipl
 
 ## Manga vocab cards (deck: Japones Vocab Mangas)
 For vocabulary extracted from manga pages. These are context-rich cards:
-- Front: manga page screenshot + Japanese sentence with the target word in <b>bold</b>
+- Front: manga panel screenshot + Japanese sentence with the target word in <b>bold</b>
 - Back: full sentence translation with the translated target word in <b>bold</b>
 
 Example: if the word is 規則 from the sentence 規則を守れ:
@@ -39,6 +40,18 @@ Example: if the word is 規則 from the sentence 規則を守れ:
 
 Use create_manga_card for individual cards, create_manga_cards_batch for multiple.
 
+## Panel-based workflow
+When panels are detected, the image you see has panels numbered ①②③... in manga \
+reading order (right-to-left, top-to-bottom). Each card will be attached with the \
+cropped panel image instead of the full page.
+
+Follow this two-pass process:
+1. **Transcribe first**: Read ALL dialogue in the image, referencing panel numbers \
+①②③... to establish full context and reading order.
+2. **Create cards**: Extract interesting vocabulary and create cards. For each card, \
+specify `panel_number` (0-based index matching the ①②③ labels) so the card gets \
+the correct cropped panel image.
+
 ## Guidelines
 - When the user sends a manga screenshot, read the text in the image, pick out \
 interesting vocabulary, and create manga vocab cards with the image attached.
@@ -46,10 +59,10 @@ interesting vocabulary, and create manga vocab cards with the image attached.
 - The `sentence` field is the full Japanese sentence with the target word wrapped in <b> tags.
 - The `translation` field is the full sentence translation with the target word wrapped in <b> tags.
 - After creating cards, ALWAYS call sync_to_server to push changes.
-- Respond in the same language as the user (Portuguese or English typically).
+- Respond in English.
 """
 
-RunAgent = Callable[[str, bytes | None], Coroutine[Any, Any, str]]
+RunAgent = Callable[[str, bytes | None, "PageAnalysis | None"], Coroutine[Any, Any, str]]
 
 
 def build_agent(
@@ -58,7 +71,7 @@ def build_agent(
     """Build the LangGraph ReAct agent with tools bound to the given managers."""
 
     # Mutable dict to hold current image bytes — tools read from here
-    image_store: dict[str, bytes] = {}
+    image_store: dict[str, Any] = {}
 
     @tool
     def create_kanji_card(
@@ -75,19 +88,28 @@ def build_agent(
         word: str,
         sentence: str,
         translation: str,
+        panel_number: int | None = None,
         attach_image: bool = True,
         tags: list[str] | None = None,
     ) -> str:
         """Create a manga vocab flashcard.
         Front: manga image + Japanese sentence (target word in <b>bold</b>).
         Back: full sentence translation (target word in <b>bold</b>).
-        Set attach_image=False to skip attaching the current image."""
-        image_bytes = image_store.get("current") if attach_image else None
+        Set panel_number (0-based) to attach the cropped panel image instead of the full page.
+        Set attach_image=False to skip attaching any image."""
+        image_bytes: bytes | None = None
+        if attach_image:
+            panels = image_store.get("panels")
+            if panel_number is not None and panels and 0 <= panel_number < len(panels):
+                image_bytes = panels[panel_number]
+            else:
+                image_bytes = image_store.get("current")
         result = manager.create_manga_card(
             word=word, sentence=sentence, translation=translation,
             image_data=image_bytes, tags=tags,
         )
-        img_status = " with image" if image_bytes else ""
+        panel_info = f" (panel {panel_number})" if panel_number is not None and image_bytes else ""
+        img_status = f" with image{panel_info}" if image_bytes else ""
         return f"Created manga card: {result.front}{img_status} (note_id={result.note_id})"
 
     @tool
@@ -118,16 +140,25 @@ def build_agent(
         cards_json: str, attach_image: bool = True
     ) -> str:
         """Create multiple manga vocab cards at once.
-        cards_json is a JSON array of objects with keys: word, sentence, translation, tags (optional).
+        cards_json is a JSON array of objects with keys:
+          word, sentence, translation, panel_number (optional, 0-based), tags (optional).
         sentence should have the target word in <b>bold</b>.
         translation should have the translated word in <b>bold</b>.
-        Set attach_image=False to skip attaching the current image."""
+        Set attach_image=False to skip attaching images."""
         cards = json.loads(cards_json)
-        image_bytes = image_store.get("current") if attach_image else None
+        panels = image_store.get("panels")
+        fallback_image = image_store.get("current")
         results = []
         errors = []
         for i, card in enumerate(cards):
             try:
+                image_bytes: bytes | None = None
+                if attach_image:
+                    pn = card.get("panel_number")
+                    if pn is not None and panels and 0 <= pn < len(panels):
+                        image_bytes = panels[pn]
+                    else:
+                        image_bytes = fallback_image
                 result = manager.create_manga_card(
                     word=card["word"],
                     sentence=card["sentence"],
@@ -189,21 +220,40 @@ def build_agent(
 
     agent = create_react_agent(llm, tools, prompt=SYSTEM_PROMPT)
 
-    async def run_agent(text: str, image_bytes: bytes | None = None) -> str:
-        """Run the agent with a user message, optionally including an image."""
-        if image_bytes:
+    async def run_agent(
+        text: str,
+        image_bytes: bytes | None = None,
+        page_analysis: PageAnalysis | None = None,
+    ) -> str:
+        """Run the agent with a user message, optionally including an image.
+
+        When page_analysis is provided, the annotated image (with panel numbers)
+        is sent to the LLM, and cropped panels are stored for card attachment.
+        """
+        # Determine which image the LLM sees vs. what gets attached to cards
+        if page_analysis:
+            # LLM sees annotated image with ①②③ labels
+            llm_image = page_analysis.annotated_image
+            # Cards get clean cropped panels
+            image_store["panels"] = [p.image_bytes for p in page_analysis.panels]
+            image_store["current"] = image_bytes  # fallback: original image
+        elif image_bytes:
+            llm_image = image_bytes
             image_store["current"] = image_bytes
+            image_store.pop("panels", None)
         else:
+            llm_image = None
             image_store.pop("current", None)
+            image_store.pop("panels", None)
 
         # Build the message content
         content: list[dict[str, Any]] = []
-        if image_bytes:
-            b64 = base64.b64encode(image_bytes).decode()
+        if llm_image:
+            b64 = base64.b64encode(llm_image).decode()
             content.append(
                 {
                     "type": "image_url",
-                    "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+                    "image_url": {"url": f"data:image/webp;base64,{b64}"},
                 }
             )
         if text:

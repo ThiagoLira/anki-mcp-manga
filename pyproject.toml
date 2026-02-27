@@ -13,6 +13,18 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+panels = [
+    "torch>=2.0",
+    "transformers>=4.44,<5",
+    "networkx",
+    "shapely",
+    "numpy",
+    "einops",
+    "pulp",
+    "scipy",
+    "matplotlib",
+    "timm",
+]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",

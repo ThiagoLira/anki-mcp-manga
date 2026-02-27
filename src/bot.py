@@ -17,6 +17,17 @@ manager = AnkiManager()
 sync_mgr = SyncManager(manager)
 run_agent = build_agent(manager, sync_mgr)
 
+# Lazy panel detector — only initialised when first image arrives
+_panel_detector = None
+
+
+def _get_panel_detector():
+    global _panel_detector
+    if _panel_detector is None:
+        from .panel_detector import PanelDetector
+        _panel_detector = PanelDetector(device=settings.panel_model_device)
+    return _panel_detector
+
 bot = Bot(token=settings.telegram_bot_token)
 dp = Dispatcher()
 
@@ -84,10 +95,23 @@ async def handle_photo(message: Message) -> None:
 
     caption = message.caption or "Extract vocabulary from this manga page and create cards."
 
+    # Panel detection (optional, runs before the agent)
+    page_analysis = None
+    if settings.enable_panel_detection:
+        processing = await message.answer("Detecting panels...")
+        try:
+            detector = _get_panel_detector()
+            page_analysis = detector.detect(image_bytes)
+            logger.info("Detected %d panels", len(page_analysis.panels))
+        except Exception as e:
+            logger.warning("Panel detection failed, falling back to full page: %s", e)
+            page_analysis = None
+        await processing.delete()
+
     processing = await message.answer("Processing image...")
     async with agent_lock:
         try:
-            response = await run_agent(caption, image_bytes)
+            response = await run_agent(caption, image_bytes, page_analysis)
         except Exception as e:
             logger.exception("Agent error")
             response = f"Error: {e}"

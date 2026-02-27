@@ -14,6 +14,9 @@ class Settings(BaseSettings):
     kanji_deck: str = "Japones KANJI"
     manga_deck: str = "Japones Vocab Mangas"
 
+    enable_panel_detection: bool = True
+    panel_model_device: str = "cuda"
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
     @property
