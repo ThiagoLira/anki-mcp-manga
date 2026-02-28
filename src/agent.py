@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, Coroutine
 
 from langchain_core.messages import HumanMessage
@@ -19,6 +20,23 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+@dataclass
+class PendingCard:
+    """A proposed manga card awaiting user review."""
+    word: str
+    sentence: str
+    translation: str
+    image_data: bytes | None = None
+    tags: list[str] | None = None
+
+
+@dataclass
+class AgentResult:
+    """Result from running the agent."""
+    text: str
+    pending_cards: list[PendingCard] = field(default_factory=list)
+
 SYSTEM_PROMPT = """\
 You are a Japanese language study assistant that creates Anki flashcards.
 You have tools to create two types of cards:
@@ -28,6 +46,7 @@ For learning kanji and vocabulary words:
 - Front: the kanji or word
 - Back: reading (hiragana) + meaning
 Use create_kanji_card for individual cards, create_kanji_cards_batch for multiple.
+After creating kanji cards, ALWAYS call sync_to_server to push changes.
 
 ## Manga vocab cards (deck: Japones Vocab Mangas)
 For vocabulary extracted from manga pages. These are context-rich cards:
@@ -38,7 +57,9 @@ Example: if the word is 規則 from the sentence 規則を守れ:
 - sentence: "<b>規則</b>を守れ"
 - translation: "Follow the <b>rules</b>"
 
-Use create_manga_card for individual cards, create_manga_cards_batch for multiple.
+Use propose_manga_card for individual cards, propose_manga_cards_batch for multiple.
+These tools PROPOSE cards for user review — they are NOT created in Anki yet.
+Do NOT call sync_to_server after proposing manga cards (sync happens after user review).
 
 ## Panel-based workflow
 When panels are detected, the image you see has panels numbered ①②③... in manga \
@@ -48,21 +69,20 @@ cropped panel image instead of the full page.
 Follow this two-pass process:
 1. **Transcribe first**: Read ALL dialogue in the image, referencing panel numbers \
 ①②③... to establish full context and reading order.
-2. **Create cards**: Extract interesting vocabulary and create cards. For each card, \
+2. **Create cards**: Extract interesting vocabulary and propose cards. For each card, \
 specify `panel_number` (0-based index matching the ①②③ labels) so the card gets \
 the correct cropped panel image.
 
 ## Guidelines
 - When the user sends a manga screenshot, read the text in the image, pick out \
-interesting vocabulary, and create manga vocab cards with the image attached.
+interesting vocabulary, and propose manga vocab cards with the image attached.
 - The `word` field is just the bare vocabulary word (for search/identification).
 - The `sentence` field is the full Japanese sentence with the target word wrapped in <b> tags.
 - The `translation` field is the full sentence translation with the target word wrapped in <b> tags.
-- After creating cards, ALWAYS call sync_to_server to push changes.
 - Respond in English.
 """
 
-RunAgent = Callable[[str, bytes | None, "PageAnalysis | None"], Coroutine[Any, Any, str]]
+RunAgent = Callable[[str, bytes | None, "PageAnalysis | None"], Coroutine[Any, Any, AgentResult]]
 
 
 def build_agent(
@@ -72,6 +92,8 @@ def build_agent(
 
     # Mutable dict to hold current image bytes — tools read from here
     image_store: dict[str, Any] = {}
+    # Accumulates proposed manga cards during a single run
+    pending_cards: list[PendingCard] = []
 
     @tool
     def create_kanji_card(
@@ -84,7 +106,7 @@ def build_agent(
         return f"Created kanji card: {result.front} (note_id={result.note_id})"
 
     @tool
-    def create_manga_card(
+    def propose_manga_card(
         word: str,
         sentence: str,
         translation: str,
@@ -92,7 +114,7 @@ def build_agent(
         attach_image: bool = True,
         tags: list[str] | None = None,
     ) -> str:
-        """Create a manga vocab flashcard.
+        """Propose a manga vocab flashcard for user review (not created in Anki yet).
         Front: manga image + Japanese sentence (target word in <b>bold</b>).
         Back: full sentence translation (target word in <b>bold</b>).
         Set panel_number (0-based) to attach the cropped panel image instead of the full page.
@@ -104,13 +126,14 @@ def build_agent(
                 image_bytes = panels[panel_number]
             else:
                 image_bytes = image_store.get("current")
-        result = manager.create_manga_card(
+        card = PendingCard(
             word=word, sentence=sentence, translation=translation,
             image_data=image_bytes, tags=tags,
         )
+        pending_cards.append(card)
         panel_info = f" (panel {panel_number})" if panel_number is not None and image_bytes else ""
         img_status = f" with image{panel_info}" if image_bytes else ""
-        return f"Created manga card: {result.front}{img_status} (note_id={result.note_id})"
+        return f"Proposed manga card: {word}{img_status}"
 
     @tool
     def create_kanji_cards_batch(cards_json: str) -> str:
@@ -136,10 +159,10 @@ def build_agent(
         return msg
 
     @tool
-    def create_manga_cards_batch(
+    def propose_manga_cards_batch(
         cards_json: str, attach_image: bool = True
     ) -> str:
-        """Create multiple manga vocab cards at once.
+        """Propose multiple manga vocab cards at once for user review (not created in Anki yet).
         cards_json is a JSON array of objects with keys:
           word, sentence, translation, panel_number (optional, 0-based), tags (optional).
         sentence should have the target word in <b>bold</b>.
@@ -148,7 +171,7 @@ def build_agent(
         cards = json.loads(cards_json)
         panels = image_store.get("panels")
         fallback_image = image_store.get("current")
-        results = []
+        proposed = []
         errors = []
         for i, card in enumerate(cards):
             try:
@@ -159,17 +182,18 @@ def build_agent(
                         image_bytes = panels[pn]
                     else:
                         image_bytes = fallback_image
-                result = manager.create_manga_card(
+                pending = PendingCard(
                     word=card["word"],
                     sentence=card["sentence"],
                     translation=card["translation"],
                     image_data=image_bytes,
                     tags=card.get("tags"),
                 )
-                results.append(result.front)
+                pending_cards.append(pending)
+                proposed.append(pending.word)
             except Exception as e:
                 errors.append(f"Card {i} ({card.get('word', '?')}): {e}")
-        msg = f"Created {len(results)} manga cards: {', '.join(results)}"
+        msg = f"Proposed {len(proposed)} manga cards: {', '.join(proposed)}"
         if errors:
             msg += f"\nErrors: {'; '.join(errors)}"
         return msg
@@ -204,9 +228,9 @@ def build_agent(
 
     tools = [
         create_kanji_card,
-        create_manga_card,
+        propose_manga_card,
         create_kanji_cards_batch,
-        create_manga_cards_batch,
+        propose_manga_cards_batch,
         sync_to_server,
         search_notes,
         list_decks,
@@ -224,12 +248,15 @@ def build_agent(
         text: str,
         image_bytes: bytes | None = None,
         page_analysis: PageAnalysis | None = None,
-    ) -> str:
+    ) -> AgentResult:
         """Run the agent with a user message, optionally including an image.
 
         When page_analysis is provided, the annotated image (with panel numbers)
         is sent to the LLM, and cropped panels are stored for card attachment.
         """
+        # Clear pending cards from any previous run
+        pending_cards.clear()
+
         # Determine which image the LLM sees vs. what gets attached to cards
         if page_analysis:
             # LLM sees annotated image with ①②③ labels
@@ -265,8 +292,7 @@ def build_agent(
 
         # Extract the last AI message
         ai_messages = [m for m in result["messages"] if m.type == "ai" and m.content]
-        if ai_messages:
-            return ai_messages[-1].content
-        return "Done."
+        text = ai_messages[-1].content if ai_messages else "Done."
+        return AgentResult(text=text, pending_cards=list(pending_cards))
 
     return run_agent

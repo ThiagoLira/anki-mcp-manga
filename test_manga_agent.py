@@ -8,7 +8,7 @@ from PIL import Image
 
 # Important: this loads .env and its credentials under the hood
 from src.config import settings
-from src.agent import build_agent
+from src.agent import AgentResult, PendingCard, build_agent
 from src.anki_manager import CardResult
 from src.note_templates import CSS
 from src.panel_detector import PanelDetector
@@ -164,8 +164,18 @@ async def main():
         try:
             page_analysis = detector.detect(image_bytes)
             logger.info(f"Detected {len(page_analysis.panels)} panels in {img_path.name}")
-            response = await run_agent(prompt, image_bytes, page_analysis)
-            logger.info(f"Agent response for {img_path.name}: {response}")
+            result = await run_agent(prompt, image_bytes, page_analysis)
+            logger.info(f"Agent response for {img_path.name}: {result.text}")
+
+            # Auto-accept all proposed cards (create them via the mock manager)
+            if result.pending_cards:
+                logger.info(f"Auto-accepting {len(result.pending_cards)} proposed cards")
+                for card in result.pending_cards:
+                    manager.create_manga_card(
+                        word=card.word, sentence=card.sentence,
+                        translation=card.translation,
+                        image_data=card.image_data, tags=card.tags,
+                    )
         except Exception as e:
             logger.exception(f"Error processing {img_path.name}: {e}")
 

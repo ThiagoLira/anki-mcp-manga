@@ -1,12 +1,22 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
+import secrets
+import time
+from dataclasses import dataclass, field
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message
+from aiogram.types import (
+    BufferedInputFile,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 
-from .agent import build_agent
+from .agent import PendingCard, build_agent
 from .anki_manager import AnkiManager
 from .config import settings
 from .sync_manager import SyncManager
@@ -33,6 +43,125 @@ dp = Dispatcher()
 
 # Serialize access to Anki collection (not thread-safe)
 agent_lock = asyncio.Lock()
+
+# ---------------------------------------------------------------------------
+# Review session infrastructure
+# ---------------------------------------------------------------------------
+
+SESSION_TTL = 3600  # 1 hour
+
+
+@dataclass
+class ReviewSession:
+    """Tracks a set of proposed cards awaiting user review."""
+    cards: list[PendingCard]
+    # status per card: None=pending, True=accepted, False=deleted
+    status: list[bool | None] = field(default_factory=list)
+    msg_ids: list[int] = field(default_factory=list)
+    chat_id: int = 0
+    created_at: float = field(default_factory=time.time)
+
+    def __post_init__(self) -> None:
+        if not self.status:
+            self.status = [None] * len(self.cards)
+
+    @property
+    def all_reviewed(self) -> bool:
+        return all(s is not None for s in self.status)
+
+    @property
+    def pending_indices(self) -> list[int]:
+        return [i for i, s in enumerate(self.status) if s is None]
+
+
+# In-memory store keyed by 8-char session ID
+pending_reviews: dict[str, ReviewSession] = {}
+
+
+def _new_session_id() -> str:
+    return secrets.token_hex(4)  # 8 hex chars
+
+
+def _purge_stale_sessions() -> None:
+    now = time.time()
+    stale = [sid for sid, s in pending_reviews.items() if now - s.created_at > SESSION_TTL]
+    for sid in stale:
+        del pending_reviews[sid]
+
+
+def _card_caption(card: PendingCard) -> str:
+    return (
+        f"<b>Word:</b> {card.word}\n"
+        f"<b>Sentence:</b> {card.sentence}\n"
+        f"<b>Translation:</b> {card.translation}"
+    )
+
+
+def _card_keyboard(session_id: str, index: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Accept", callback_data=f"mc:{session_id}:{index}:a"),
+        InlineKeyboardButton(text="❌ Delete", callback_data=f"mc:{session_id}:{index}:d"),
+    ]])
+
+
+def _bulk_keyboard(session_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Accept All", callback_data=f"mc:{session_id}:all:a"),
+        InlineKeyboardButton(text="❌ Delete All", callback_data=f"mc:{session_id}:all:d"),
+    ]])
+
+
+async def _send_card_previews(
+    chat_id: int, session_id: str, session: ReviewSession
+) -> None:
+    """Send each proposed card as a photo+caption with inline keyboards."""
+    for i, card in enumerate(session.cards):
+        kb = _card_keyboard(session_id, i)
+        caption = _card_caption(card)
+        if card.image_data:
+            photo = BufferedInputFile(card.image_data, filename=f"card_{i}.webp")
+            msg = await bot.send_photo(
+                chat_id, photo=photo, caption=caption,
+                parse_mode="HTML", reply_markup=kb,
+            )
+        else:
+            msg = await bot.send_message(
+                chat_id, text=caption,
+                parse_mode="HTML", reply_markup=kb,
+            )
+        session.msg_ids.append(msg.message_id)
+
+    # Bulk buttons if more than one card
+    if len(session.cards) > 1:
+        bulk_msg = await bot.send_message(
+            chat_id, text=f"{len(session.cards)} cards proposed — review above or use bulk actions:",
+            reply_markup=_bulk_keyboard(session_id),
+        )
+        session.msg_ids.append(bulk_msg.message_id)
+
+
+async def _finalize_session(session_id: str, session: ReviewSession) -> None:
+    """Create accepted cards in Anki, sync, send summary, clean up."""
+    accepted = sum(1 for s in session.status if s is True)
+    deleted = sum(1 for s in session.status if s is False)
+
+    if accepted > 0:
+        sync_result = sync_mgr.sync()
+        sync_info = f"\nSync: {sync_result['collection_sync']}"
+    else:
+        sync_info = ""
+
+    await bot.send_message(
+        session.chat_id,
+        f"Review complete: {accepted} accepted, {deleted} deleted.{sync_info}",
+    )
+
+    del pending_reviews[session_id]
+
+
+# ---------------------------------------------------------------------------
+# Handlers
+# ---------------------------------------------------------------------------
 
 
 def _is_allowed(user_id: int) -> bool:
@@ -111,12 +240,28 @@ async def handle_photo(message: Message) -> None:
     processing = await message.answer("Processing image...")
     async with agent_lock:
         try:
-            response = await run_agent(caption, image_bytes, page_analysis)
+            result = await run_agent(caption, image_bytes, page_analysis)
         except Exception as e:
             logger.exception("Agent error")
-            response = f"Error: {e}"
+            await processing.delete()
+            await message.answer(f"Error: {e}")
+            return
     await processing.delete()
-    await message.answer(response)
+
+    # Send agent text response
+    if result.text:
+        await message.answer(result.text)
+
+    # If there are proposed cards, start a review session
+    if result.pending_cards:
+        _purge_stale_sessions()
+        session_id = _new_session_id()
+        session = ReviewSession(
+            cards=result.pending_cards,
+            chat_id=message.chat.id,
+        )
+        pending_reviews[session_id] = session
+        await _send_card_previews(message.chat.id, session_id, session)
 
 
 @dp.message(F.text)
@@ -130,12 +275,133 @@ async def handle_text(message: Message) -> None:
     processing = await message.answer("Thinking...")
     async with agent_lock:
         try:
-            response = await run_agent(message.text)
+            result = await run_agent(message.text)
         except Exception as e:
             logger.exception("Agent error")
-            response = f"Error: {e}"
+            await processing.delete()
+            await message.answer(f"Error: {e}")
+            return
     await processing.delete()
-    await message.answer(response)
+    await message.answer(result.text)
+
+
+@dp.callback_query(F.data.startswith("mc:"))
+async def handle_card_review(callback: CallbackQuery) -> None:
+    """Handle Accept/Delete button presses for card review."""
+    parts = callback.data.split(":")
+    if len(parts) != 4:
+        await callback.answer("Invalid callback data.")
+        return
+
+    _, session_id, index_str, action = parts
+
+    session = pending_reviews.get(session_id)
+    if session is None:
+        await callback.answer("Session expired.", show_alert=True)
+        return
+
+    accept = action == "a"
+
+    # --- Bulk action ---
+    if index_str == "all":
+        remaining = session.pending_indices
+        if not remaining:
+            await callback.answer("All cards already reviewed.")
+            return
+
+        async with agent_lock:
+            for i in remaining:
+                session.status[i] = accept
+                if accept:
+                    card = session.cards[i]
+                    manager.create_manga_card(
+                        word=card.word, sentence=card.sentence,
+                        translation=card.translation,
+                        image_data=card.image_data, tags=card.tags,
+                    )
+                # Update individual card message
+                status_text = "✅ Accepted" if accept else "❌ Deleted"
+                card = session.cards[i]
+                caption = _card_caption(card) + f"\n\n{status_text}"
+                msg_id = session.msg_ids[i]
+                try:
+                    if card.image_data:
+                        await bot.edit_message_caption(
+                            chat_id=session.chat_id, message_id=msg_id,
+                            caption=caption, parse_mode="HTML",
+                        )
+                    else:
+                        await bot.edit_message_text(
+                            chat_id=session.chat_id, message_id=msg_id,
+                            text=caption, parse_mode="HTML",
+                        )
+                except Exception:
+                    pass  # message may already be edited
+
+        # Remove bulk keyboard
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
+        action_word = "Accepted" if accept else "Deleted"
+        await callback.answer(f"{action_word} {len(remaining)} cards.")
+
+        if session.all_reviewed:
+            await _finalize_session(session_id, session)
+        return
+
+    # --- Single card action ---
+    index = int(index_str)
+    if index < 0 or index >= len(session.cards):
+        await callback.answer("Invalid card index.")
+        return
+
+    if session.status[index] is not None:
+        await callback.answer("Already reviewed.")
+        return
+
+    card = session.cards[index]
+
+    async with agent_lock:
+        session.status[index] = accept
+        if accept:
+            manager.create_manga_card(
+                word=card.word, sentence=card.sentence,
+                translation=card.translation,
+                image_data=card.image_data, tags=card.tags,
+            )
+
+    # Update the message to show result and remove keyboard
+    status_text = "✅ Accepted" if accept else "❌ Deleted"
+    caption = _card_caption(card) + f"\n\n{status_text}"
+    try:
+        if card.image_data:
+            await callback.message.edit_caption(
+                caption=caption, parse_mode="HTML",
+            )
+        else:
+            await callback.message.edit_text(
+                text=caption, parse_mode="HTML",
+            )
+    except Exception:
+        pass
+
+    await callback.answer(status_text)
+
+    # Check if all cards reviewed
+    if session.all_reviewed:
+        # Remove bulk keyboard message if it exists
+        if len(session.cards) > 1 and len(session.msg_ids) > len(session.cards):
+            try:
+                bulk_msg_id = session.msg_ids[-1]
+                await bot.edit_message_text(
+                    chat_id=session.chat_id, message_id=bulk_msg_id,
+                    text="All cards reviewed.",
+                )
+            except Exception:
+                pass
+        await _finalize_session(session_id, session)
 
 
 async def main() -> None:
