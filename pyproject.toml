@@ -14,6 +14,13 @@ dependencies = [
 
 [project.optional-dependencies]
 panels = [
+    "onnxruntime",
+    "numpy",
+    "networkx",
+    "shapely",
+    "Pillow>=10.0",
+]
+panels-torch = [
     "torch>=2.0",
     "transformers>=4.44,<5",
     "networkx",
@@ -24,13 +31,6 @@ panels = [
     "scipy",
     "matplotlib",
     "timm",
-]
-panels-onnx = [
-    "onnxruntime",
-    "numpy",
-    "networkx",
-    "shapely",
-    "Pillow>=10.0",
 ]
 dev = [
     "pytest>=8.0",
