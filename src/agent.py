@@ -16,19 +16,24 @@ from .config import settings
 if TYPE_CHECKING:
     from .anki_manager import AnkiManager
     from .panel_detector import PageAnalysis
-    from .sync_manager import SyncManager
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
 class PendingCard:
-    """A proposed manga card awaiting user review."""
-    word: str
-    sentence: str
-    translation: str
+    """A proposed card awaiting user review."""
+    card_type: str  # "manga" or "kanji"
+    # Manga fields
+    word: str = ""
+    sentence: str = ""
+    translation: str = ""
     image_data: bytes | None = None
     tags: list[str] | None = None
+    # Kanji fields
+    kanji: str = ""
+    reading: str = ""
+    meaning: str = ""
 
 
 @dataclass
@@ -39,14 +44,14 @@ class AgentResult:
 
 SYSTEM_PROMPT = """\
 You are a Japanese language study assistant that creates Anki flashcards.
-You have tools to create two types of cards:
+You have tools to propose two types of cards for user review:
 
 ## Kanji cards (deck: Japones KANJI)
 For learning kanji and vocabulary words:
 - Front: the kanji or word
 - Back: reading (hiragana) + meaning
-Use create_kanji_card for individual cards, create_kanji_cards_batch for multiple.
-After creating kanji cards, ALWAYS call sync_to_server to push changes.
+Use propose_kanji_card for individual cards, propose_kanji_cards_batch for multiple.
+These tools PROPOSE cards for user review — they are NOT created in Anki yet.
 
 ## Manga vocab cards (deck: Japones Vocab Mangas)
 For vocabulary extracted from manga pages. These are context-rich cards:
@@ -59,7 +64,6 @@ Example: if the word is 規則 from the sentence 規則を守れ:
 
 Use propose_manga_card for individual cards, propose_manga_cards_batch for multiple.
 These tools PROPOSE cards for user review — they are NOT created in Anki yet.
-Do NOT call sync_to_server after proposing manga cards (sync happens after user review).
 
 ## Panel-based workflow
 When panels are detected, the image you see has panels numbered ①②③... in manga \
@@ -85,9 +89,7 @@ interesting vocabulary, and propose manga vocab cards with the image attached.
 RunAgent = Callable[[str, bytes | None, "PageAnalysis | None"], Coroutine[Any, Any, AgentResult]]
 
 
-def build_agent(
-    manager: AnkiManager, sync_mgr: SyncManager
-) -> RunAgent:
+def build_agent(manager: AnkiManager) -> RunAgent:
     """Build the LangGraph ReAct agent with tools bound to the given managers."""
 
     # Mutable dict to hold current image bytes — tools read from here
@@ -96,14 +98,17 @@ def build_agent(
     pending_cards: list[PendingCard] = []
 
     @tool
-    def create_kanji_card(
+    def propose_kanji_card(
         kanji: str, reading: str, meaning: str, tags: list[str] | None = None
     ) -> str:
-        """Create a kanji/vocab flashcard. Front: kanji. Back: reading + meaning."""
-        result = manager.create_kanji_card(
-            kanji=kanji, reading=reading, meaning=meaning, tags=tags
+        """Propose a kanji/vocab flashcard for user review (not created in Anki yet).
+        Front: kanji. Back: reading + meaning."""
+        card = PendingCard(
+            card_type="kanji", kanji=kanji, reading=reading,
+            meaning=meaning, tags=tags,
         )
-        return f"Created kanji card: {result.front} (note_id={result.note_id})"
+        pending_cards.append(card)
+        return f"Proposed kanji card: {kanji}"
 
     @tool
     def propose_manga_card(
@@ -127,8 +132,8 @@ def build_agent(
             else:
                 image_bytes = image_store.get("current")
         card = PendingCard(
-            word=word, sentence=sentence, translation=translation,
-            image_data=image_bytes, tags=tags,
+            card_type="manga", word=word, sentence=sentence,
+            translation=translation, image_data=image_bytes, tags=tags,
         )
         pending_cards.append(card)
         panel_info = f" (panel {panel_number})" if panel_number is not None and image_bytes else ""
@@ -136,24 +141,26 @@ def build_agent(
         return f"Proposed manga card: {word}{img_status}"
 
     @tool
-    def create_kanji_cards_batch(cards_json: str) -> str:
-        """Create multiple kanji cards at once.
+    def propose_kanji_cards_batch(cards_json: str) -> str:
+        """Propose multiple kanji cards at once for user review (not created in Anki yet).
         cards_json is a JSON array of objects with keys: kanji, reading, meaning, tags (optional)."""
         cards = json.loads(cards_json)
-        results = []
+        proposed = []
         errors = []
-        for i, card in enumerate(cards):
+        for i, card_data in enumerate(cards):
             try:
-                result = manager.create_kanji_card(
-                    kanji=card["kanji"],
-                    reading=card["reading"],
-                    meaning=card["meaning"],
-                    tags=card.get("tags"),
+                card = PendingCard(
+                    card_type="kanji",
+                    kanji=card_data["kanji"],
+                    reading=card_data["reading"],
+                    meaning=card_data["meaning"],
+                    tags=card_data.get("tags"),
                 )
-                results.append(result.front)
+                pending_cards.append(card)
+                proposed.append(card.kanji)
             except Exception as e:
-                errors.append(f"Card {i} ({card.get('kanji', '?')}): {e}")
-        msg = f"Created {len(results)} kanji cards: {', '.join(results)}"
+                errors.append(f"Card {i} ({card_data.get('kanji', '?')}): {e}")
+        msg = f"Proposed {len(proposed)} kanji cards: {', '.join(proposed)}"
         if errors:
             msg += f"\nErrors: {'; '.join(errors)}"
         return msg
@@ -183,6 +190,7 @@ def build_agent(
                     else:
                         image_bytes = fallback_image
                 pending = PendingCard(
+                    card_type="manga",
                     word=card["word"],
                     sentence=card["sentence"],
                     translation=card["translation"],
@@ -197,13 +205,6 @@ def build_agent(
         if errors:
             msg += f"\nErrors: {'; '.join(errors)}"
         return msg
-
-    @tool
-    def sync_to_server() -> str:
-        """Sync the Anki collection and media to the self-hosted sync server.
-        Call this after creating cards."""
-        result = sync_mgr.sync()
-        return f"Synced — collection: {result['collection_sync']}, media: {result['media_sync']}"
 
     @tool
     def search_notes(query: str) -> str:
@@ -227,11 +228,10 @@ def build_agent(
         return "\n".join(f"- {d['name']}: {d['note_count']} notes" for d in decks)
 
     tools = [
-        create_kanji_card,
+        propose_kanji_card,
         propose_manga_card,
-        create_kanji_cards_batch,
+        propose_kanji_cards_batch,
         propose_manga_cards_batch,
-        sync_to_server,
         search_notes,
         list_decks,
     ]

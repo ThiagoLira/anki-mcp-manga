@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 manager = AnkiManager()
 sync_mgr = SyncManager(manager)
-run_agent = build_agent(manager, sync_mgr)
+run_agent = build_agent(manager)
 
 # Lazy panel detector — only initialised when first image arrives
 _panel_detector = None
@@ -99,6 +99,11 @@ def _purge_stale_sessions() -> None:
 
 
 def _card_caption(card: PendingCard) -> str:
+    if card.card_type == "kanji":
+        return (
+            f"<b>Front:</b> {card.kanji}\n"
+            f"<b>Back:</b> {card.reading} ({card.meaning})"
+        )
     return (
         f"<b>Word:</b> {card.word}\n"
         f"<b>Sentence:</b> {card.sentence}\n"
@@ -147,6 +152,21 @@ async def _send_card_previews(
             reply_markup=_bulk_keyboard(session_id),
         )
         session.msg_ids.append(bulk_msg.message_id)
+
+
+def _create_card(card: PendingCard) -> None:
+    """Create the actual Anki card from a pending card."""
+    if card.card_type == "kanji":
+        manager.create_kanji_card(
+            kanji=card.kanji, reading=card.reading,
+            meaning=card.meaning, tags=card.tags,
+        )
+    else:
+        manager.create_manga_card(
+            word=card.word, sentence=card.sentence,
+            translation=card.translation,
+            image_data=card.image_data, tags=card.tags,
+        )
 
 
 async def _finalize_session(session_id: str, session: ReviewSession) -> None:
@@ -298,7 +318,20 @@ async def handle_text(message: Message) -> None:
             await message.answer(f"Error: {e}")
             return
     await processing.delete()
-    await message.answer(result.text)
+
+    if result.text:
+        await message.answer(result.text)
+
+    # If there are proposed cards, start a review session
+    if result.pending_cards:
+        _purge_stale_sessions()
+        session_id = _new_session_id()
+        session = ReviewSession(
+            cards=result.pending_cards,
+            chat_id=message.chat.id,
+        )
+        pending_reviews[session_id] = session
+        await _send_card_previews(message.chat.id, session_id, session)
 
 
 @dp.callback_query(F.data.startswith("mc:"))
@@ -329,12 +362,7 @@ async def handle_card_review(callback: CallbackQuery) -> None:
             for i in remaining:
                 session.status[i] = accept
                 if accept:
-                    card = session.cards[i]
-                    manager.create_manga_card(
-                        word=card.word, sentence=card.sentence,
-                        translation=card.translation,
-                        image_data=card.image_data, tags=card.tags,
-                    )
+                    _create_card(session.cards[i])
                 # Update individual card message
                 status_text = "✅ Accepted" if accept else "❌ Deleted"
                 card = session.cards[i]
@@ -382,11 +410,7 @@ async def handle_card_review(callback: CallbackQuery) -> None:
     async with agent_lock:
         session.status[index] = accept
         if accept:
-            manager.create_manga_card(
-                word=card.word, sentence=card.sentence,
-                translation=card.translation,
-                image_data=card.image_data, tags=card.tags,
-            )
+            _create_card(card)
 
     # Update the message to show result and remove keyboard
     status_text = "✅ Accepted" if accept else "❌ Deleted"
