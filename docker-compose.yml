@@ -15,7 +15,7 @@ services:
       context: .
       dockerfile: Dockerfile.syncserver
     ports:
-      - "8080:8080"
+      - "${SYNC_BIND_IP:-0.0.0.0}:8080:8080"
     volumes:
       - ./data/sync:/data
     env_file: .env
