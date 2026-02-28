@@ -346,8 +346,40 @@ def _annotate_page(image: Image.Image, panel_bboxes: list[list[float]]) -> Image
 # PanelDetector — main entry point
 # ---------------------------------------------------------------------------
 
+def _build_page_analysis(
+    image_np: np.ndarray, raw_panels: list[list[float]]
+) -> PageAnalysis:
+    """Sort panels, crop, annotate — shared by both PyTorch and ONNX paths."""
+    if not raw_panels:
+        logger.warning("No panels detected, returning full page as single panel.")
+        h, w = image_np.shape[:2]
+        raw_panels = [[0, 0, w, h]]
+
+    if len(raw_panels) == 1:
+        order = [0]
+    else:
+        order = sort_panels(raw_panels)
+
+    sorted_bboxes = [raw_panels[i] for i in order]
+
+    panels: list[Panel] = []
+    pil_image = Image.fromarray(image_np)
+    for idx, bbox in enumerate(sorted_bboxes):
+        x1, y1, x2, y2 = [int(round(v)) for v in bbox]
+        cropped = pil_image.crop((x1, y1, x2, y2)).convert("RGB")
+        buf = io.BytesIO()
+        cropped.save(buf, format="WebP", quality=85)
+        panels.append(Panel(index=idx, bbox=bbox, image_bytes=buf.getvalue()))
+
+    annotated = _annotate_page(pil_image, sorted_bboxes)
+    ann_buf = io.BytesIO()
+    annotated.save(ann_buf, format="WebP", quality=85)
+
+    return PageAnalysis(panels=panels, annotated_image=ann_buf.getvalue())
+
+
 class PanelDetector:
-    """Lazy-loading MagiV2 wrapper for manga panel detection."""
+    """Lazy-loading MagiV2 wrapper for manga panel detection (PyTorch)."""
 
     def __init__(self, device: str = "cuda"):
         self._device = device
@@ -384,32 +416,184 @@ class PanelDetector:
         page = results[0]
         raw_panels = _convert_to_list_of_lists(page["panels"])
 
-        if not raw_panels:
-            logger.warning("No panels detected, returning full page as single panel.")
-            h, w = image_np.shape[:2]
-            raw_panels = [[0, 0, w, h]]
+        return _build_page_analysis(image_np, raw_panels)
 
-        # Sort panels in manga reading order
-        if len(raw_panels) == 1:
-            order = [0]
-        else:
-            order = sort_panels(raw_panels)
 
-        sorted_bboxes = [raw_panels[i] for i in order]
+# ---------------------------------------------------------------------------
+# ONNX inference path — no PyTorch / transformers required
+# ---------------------------------------------------------------------------
 
-        # Crop each panel
-        panels: list[Panel] = []
-        pil_image = Image.fromarray(image_np)
-        for idx, bbox in enumerate(sorted_bboxes):
-            x1, y1, x2, y2 = [int(round(v)) for v in bbox]
-            cropped = pil_image.crop((x1, y1, x2, y2)).convert("RGB")
-            buf = io.BytesIO()
-            cropped.save(buf, format="WebP", quality=85)
-            panels.append(Panel(index=idx, bbox=bbox, image_bytes=buf.getvalue()))
+# Preprocessing constants (ConditionalDETR / ImageNet defaults)
+_RESIZE_SHORTEST = 800
+_RESIZE_LONGEST = 1333
+_IMAGE_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+_IMAGE_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
-        # Annotate full page with panel numbers
-        annotated = _annotate_page(pil_image, sorted_bboxes)
-        ann_buf = io.BytesIO()
-        annotated.save(ann_buf, format="WebP", quality=85)
+# Post-processing constants
+_PANEL_CLASS_IDX = 2  # MagiV2 class ordering: char=0, text=1, panel=2, tail=3
+_SCORE_THRESHOLD = 0.2
+_NMS_IOU_THRESHOLD = 0.5
 
-        return PageAnalysis(panels=panels, annotated_image=ann_buf.getvalue())
+
+def _preprocess_image(
+    image_np: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Resize, normalise, and format an image for the ONNX panel detector.
+
+    Args:
+        image_np: RGB uint8 array (H, W, 3).
+
+    Returns:
+        pixel_values: (1, 3, H', W') float32
+        pixel_mask:   (1, H', W') float32
+    """
+    h, w = image_np.shape[:2]
+
+    # Scale so shortest edge = 800, longest capped at 1333
+    short, long = (w, h) if w <= h else (h, w)
+    size = _RESIZE_SHORTEST
+    if long / short * size > _RESIZE_LONGEST:
+        size = int(round(_RESIZE_LONGEST * short / long))
+
+    if w <= h:
+        new_w = size
+        new_h = int(size * h / w)
+    else:
+        new_h = size
+        new_w = int(size * w / h)
+
+    pil_img = Image.fromarray(image_np).resize((new_w, new_h), Image.BILINEAR)
+    img = np.array(pil_img, dtype=np.float32) / 255.0
+
+    # Normalise with ImageNet statistics
+    img = (img - _IMAGE_MEAN) / _IMAGE_STD
+
+    # HWC → CHW, add batch dimension
+    pixel_values = img.transpose(2, 0, 1)[np.newaxis]  # (1, 3, H', W')
+    pixel_mask = np.ones((1, new_h, new_w), dtype=np.float32)
+
+    return pixel_values, pixel_mask
+
+
+def _suppress_overlapping_panels(
+    boxes: np.ndarray, scores: np.ndarray, overlap_threshold: float = 0.5
+) -> list[int]:
+    """Greedy overlap-based panel suppression matching MagiV2 logic.
+
+    Keeps panels whose area is NOT >50% covered by the union of
+    already-accepted panels (sorted by score descending).
+    """
+    order = scores.argsort()[::-1]
+    keep: list[int] = []
+    # Track union of kept panels as a list of boxes (use shapely for intersection)
+    union_x1, union_y1, union_x2, union_y2 = 0.0, 0.0, 0.0, 0.0
+    union_poly = _box(0, 0, 0, 0)
+
+    for idx in order:
+        bx1, by1, bx2, by2 = boxes[idx]
+        panel_poly = _box(float(bx1), float(by1), float(bx2), float(by2))
+        panel_area = panel_poly.area
+        if panel_area == 0:
+            continue
+        if union_poly.intersection(panel_poly).area / panel_area > overlap_threshold:
+            continue
+        keep.append(int(idx))
+        union_poly = union_poly.union(panel_poly)
+
+    return keep
+
+
+def _postprocess_detections(
+    class_scores: np.ndarray,
+    boxes: np.ndarray,
+    orig_h: int,
+    orig_w: int,
+) -> list[list[float]]:
+    """Convert raw model outputs to panel bounding boxes in pixel coords.
+
+    Replicates MagiV2's ``predict_detections_and_associations`` logic:
+    argmax class → sigmoid confidence → filter panels → overlap suppression.
+
+    Args:
+        class_scores: (1, N, C) raw logits
+        boxes:        (1, N, 4) sigmoid values in centre format (cx, cy, w, h)
+        orig_h, orig_w: original image dimensions
+
+    Returns:
+        List of [x1, y1, x2, y2] bounding boxes.
+    """
+    logits = class_scores[0]  # (N, C)
+    bboxes = boxes[0]  # (N, 4)
+
+    # MagiV2 scoring: argmax across classes, sigmoid on the winning logit
+    labels = logits.argmax(axis=-1)  # (N,)
+    max_logits = logits.max(axis=-1)  # (N,)
+    confidences = 1.0 / (1.0 + np.exp(-max_logits))
+
+    # Keep only detections classified as panel (label == 2)
+    panel_mask = labels == _PANEL_CLASS_IDX
+    confidences = confidences[panel_mask]
+    bboxes = bboxes[panel_mask]
+
+    if len(confidences) == 0:
+        return []
+
+    # Centre (cx, cy, w, h) → corner (x1, y1, x2, y2), scaled to pixels
+    cx, cy, bw, bh = bboxes[:, 0], bboxes[:, 1], bboxes[:, 2], bboxes[:, 3]
+    x1 = np.clip((cx - bw / 2) * orig_w, 0, orig_w)
+    y1 = np.clip((cy - bh / 2) * orig_h, 0, orig_h)
+    x2 = np.clip((cx + bw / 2) * orig_w, 0, orig_w)
+    y2 = np.clip((cy + bh / 2) * orig_h, 0, orig_h)
+    corner_boxes = np.stack([x1, y1, x2, y2], axis=1)
+
+    # Score threshold + overlap-based suppression (matches MagiV2 logic)
+    score_mask = confidences > _SCORE_THRESHOLD
+    corner_boxes = corner_boxes[score_mask]
+    confidences = confidences[score_mask]
+
+    if len(confidences) == 0:
+        return []
+
+    keep = _suppress_overlapping_panels(corner_boxes, confidences)
+    return corner_boxes[keep].tolist()
+
+
+class OnnxPanelDetector:
+    """ONNX-based panel detector — no PyTorch or transformers required."""
+
+    def __init__(self, model_path: str = "models/panel_detector.onnx"):
+        self._model_path = model_path
+        self._session = None
+
+    def _load_model(self):
+        if self._session is not None:
+            return
+        import onnxruntime as ort
+
+        logger.info("Loading ONNX panel detector from %s ...", self._model_path)
+        self._session = ort.InferenceSession(
+            self._model_path,
+            providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+        )
+        logger.info(
+            "ONNX panel detector ready (providers: %s)",
+            self._session.get_providers(),
+        )
+
+    def detect(self, image_bytes: bytes) -> PageAnalysis:
+        """Detect panels, sort in reading order, crop, and annotate."""
+        self._load_model()
+
+        image = Image.open(io.BytesIO(image_bytes)).convert("L").convert("RGB")
+        image_np = np.array(image)
+        orig_h, orig_w = image_np.shape[:2]
+
+        pixel_values, pixel_mask = _preprocess_image(image_np)
+        class_scores, boxes = self._session.run(
+            None,
+            {"pixel_values": pixel_values, "pixel_mask": pixel_mask},
+        )
+
+        raw_panels = _postprocess_detections(class_scores, boxes, orig_h, orig_w)
+
+        return _build_page_analysis(image_np, raw_panels)

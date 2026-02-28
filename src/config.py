@@ -17,6 +17,7 @@ class Settings(BaseSettings):
 
     enable_panel_detection: bool = True
     panel_model_device: str = "cuda"
+    panel_model_path: str = "models/panel_detector.onnx"
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 

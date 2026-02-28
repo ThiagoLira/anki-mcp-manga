@@ -1,6 +1,6 @@
 FROM python:3.11-slim
 
-# Pillow + panels system deps
+# Image processing system deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libjpeg62-turbo-dev libwebp-dev zlib1g-dev \
     && rm -rf /var/lib/apt/lists/*
@@ -8,13 +8,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 COPY pyproject.toml .
-
-# Install CPU-only torch first (avoids downloading 2GB CUDA libs),
-# then install the rest of the project with panels extras
-RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu \
-    && pip install --no-cache-dir ".[panels]"
+RUN pip install --no-cache-dir ".[panels-onnx]"
 
 COPY src/ src/
+COPY models/ models/
 
 # Collection data lives here (mount as volume)
 RUN mkdir -p /data

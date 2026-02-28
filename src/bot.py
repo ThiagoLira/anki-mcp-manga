@@ -34,8 +34,17 @@ _panel_detector = None
 def _get_panel_detector():
     global _panel_detector
     if _panel_detector is None:
-        from .panel_detector import PanelDetector
-        _panel_detector = PanelDetector(device=settings.panel_model_device)
+        from pathlib import Path
+
+        onnx_path = Path(settings.panel_model_path)
+        if onnx_path.exists():
+            from .panel_detector import OnnxPanelDetector
+
+            _panel_detector = OnnxPanelDetector(model_path=str(onnx_path))
+        else:
+            from .panel_detector import PanelDetector
+
+            _panel_detector = PanelDetector(device=settings.panel_model_device)
     return _panel_detector
 
 bot = Bot(token=settings.telegram_bot_token)
