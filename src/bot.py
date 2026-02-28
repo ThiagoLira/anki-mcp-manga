@@ -164,14 +164,21 @@ async def _finalize_session(session_id: str, session: ReviewSession) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _is_allowed(user_id: int) -> bool:
-    allowed = settings.allowed_user_ids
-    return not allowed or user_id in allowed
+def _is_allowed(user_id: int, username: str | None = None) -> bool:
+    ids = settings.allowed_user_ids
+    names = settings.allowed_usernames
+    if not ids and not names:
+        return True  # no restrictions configured
+    if ids and user_id in ids:
+        return True
+    if names and username and username.lower() in names:
+        return True
+    return False
 
 
 @dp.message(F.text == "/start")
 async def cmd_start(message: Message) -> None:
-    if not _is_allowed(message.from_user.id):
+    if not _is_allowed(message.from_user.id, message.from_user.username):
         return
     await message.answer(
         "Welcome to Anki Bot!\n\n"
@@ -185,7 +192,7 @@ async def cmd_start(message: Message) -> None:
 
 @dp.message(F.text == "/stats")
 async def cmd_stats(message: Message) -> None:
-    if not _is_allowed(message.from_user.id):
+    if not _is_allowed(message.from_user.id, message.from_user.username):
         return
     stats = manager.get_stats()
     await message.answer(
@@ -199,7 +206,7 @@ async def cmd_stats(message: Message) -> None:
 
 @dp.message(F.text == "/decks")
 async def cmd_decks(message: Message) -> None:
-    if not _is_allowed(message.from_user.id):
+    if not _is_allowed(message.from_user.id, message.from_user.username):
         return
     decks = manager.list_decks()
     if not decks:
@@ -213,7 +220,7 @@ async def cmd_decks(message: Message) -> None:
 
 @dp.message(F.photo)
 async def handle_photo(message: Message) -> None:
-    if not _is_allowed(message.from_user.id):
+    if not _is_allowed(message.from_user.id, message.from_user.username):
         return
 
     # Download the largest resolution photo
@@ -266,7 +273,7 @@ async def handle_photo(message: Message) -> None:
 
 @dp.message(F.text)
 async def handle_text(message: Message) -> None:
-    if not _is_allowed(message.from_user.id):
+    if not _is_allowed(message.from_user.id, message.from_user.username):
         return
     # Skip unknown commands
     if message.text.startswith("/"):

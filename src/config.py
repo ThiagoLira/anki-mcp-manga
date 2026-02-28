@@ -4,6 +4,7 @@ from pydantic_settings import BaseSettings
 class Settings(BaseSettings):
     telegram_bot_token: str
     allowed_telegram_user_ids: str = ""
+    allowed_telegram_usernames: str = ""
     openrouter_api_key: str
     openrouter_model: str = "anthropic/claude-sonnet-4"
 
@@ -24,6 +25,12 @@ class Settings(BaseSettings):
         if not self.allowed_telegram_user_ids:
             return []
         return [int(x.strip()) for x in self.allowed_telegram_user_ids.split(",")]
+
+    @property
+    def allowed_usernames(self) -> list[str]:
+        if not self.allowed_telegram_usernames:
+            return []
+        return [x.strip().lstrip("@").lower() for x in self.allowed_telegram_usernames.split(",")]
 
 
 settings = Settings()
