@@ -79,7 +79,7 @@ KANJI_AFMT = """\
 # Back: full sentence translation (target word bolded)
 
 MANGA_NOTETYPE = "Manga Vocab"
-MANGA_FIELDS = ["Word", "Sentence", "Image", "Translation"]
+MANGA_FIELDS = ["Word", "Sentence", "Image", "Translation", "Reading", "Audio"]
 
 MANGA_QFMT = """\
 {{#Image}}<div class="manga-image">{{Image}}</div>{{/Image}}
@@ -88,14 +88,36 @@ MANGA_QFMT = """\
 MANGA_AFMT = """\
 {{FrontSide}}
 <hr id="answer">
+{{#Reading}}<div class="reading">{{Reading}}</div>{{/Reading}}
 <div class="translation">{{Translation}}</div>
+{{#Audio}}<div class="audio">{{Audio}}</div>{{/Audio}}
 """
 
 
 def _ensure(col: Collection, name: str, fields: list[str], qfmt: str, afmt: str) -> dict:
-    """Get or create a notetype with a single card template."""
+    """Get or create a notetype with a single card template.
+
+    If the notetype already exists, adds any missing fields and updates
+    the card template formats (migration for schema changes).
+    """
     existing = col.models.by_name(name)
     if existing:
+        # Add any missing fields (migration)
+        existing_names = {f["name"] for f in existing["flds"]}
+        changed = False
+        for field_name in fields:
+            if field_name not in existing_names:
+                new_field = col.models.new_field(field_name)
+                col.models.add_field(existing, new_field)
+                changed = True
+        # Update template formats if they changed
+        tmpl = existing["tmpls"][0]
+        if tmpl["qfmt"] != qfmt or tmpl["afmt"] != afmt:
+            tmpl["qfmt"] = qfmt
+            tmpl["afmt"] = afmt
+            changed = True
+        if changed:
+            col.models.update_dict(existing)
         return existing
 
     model = col.models.new(name)

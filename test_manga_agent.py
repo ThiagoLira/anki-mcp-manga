@@ -64,12 +64,6 @@ HTML_FOOTER = """\
 """
 
 
-class MockSyncManager:
-    def sync(self) -> dict:
-        logger.info("[MockSyncManager] sync() called")
-        return {"collection_sync": "mocked", "media_sync": "mocked"}
-
-
 class MockAnkiManager:
     def __init__(self, output_html_path: Path):
         self.output_html_path = output_html_path
@@ -83,9 +77,9 @@ class MockAnkiManager:
         self._append_card_to_html(front_html, back_html)
         return CardResult(note_id=1, front=kanji, deck="Mock Kanji")
 
-    def create_manga_card(self, word: str, sentence: str, translation: str, image_data: bytes | None = None, tags: list[str] | None = None) -> CardResult:
-        logger.info(f"[MockAnkiManager] create_manga_card: {word}")
-        
+    def create_manga_card(self, word: str, sentence: str, translation: str, image_data: bytes | None = None, reading: str = "", audio_data: bytes | None = None, tags: list[str] | None = None) -> CardResult:
+        logger.info(f"[MockAnkiManager] create_manga_card: {word} (reading={reading})")
+
         # Compress and format the image if provided
         img_html = ""
         if image_data:
@@ -101,9 +95,15 @@ class MockAnkiManager:
             img_b64 = base64.b64encode(buf.getvalue()).decode()
             img_html = f'<div class="manga-image"><img src="data:image/webp;base64,{img_b64}"></div>'
 
+        reading_html = f'<div class="reading">{reading}</div>' if reading else ""
+        audio_html = ""
+        if audio_data:
+            audio_b64 = base64.b64encode(audio_data).decode()
+            audio_html = f'<div class="audio"><audio controls src="data:audio/wav;base64,{audio_b64}"></audio></div>'
+
         front_html = f'<div class="card">{img_html}<div class="sentence">{sentence}</div></div>'
-        back_html = f'<div class="card">{img_html}<div class="sentence">{sentence}</div><hr id="answer"><div class="translation">{translation}</div></div>'
-        
+        back_html = f'<div class="card">{img_html}<div class="sentence">{sentence}</div><hr id="answer">{reading_html}<div class="translation">{translation}</div>{audio_html}</div>'
+
         self._append_card_to_html(front_html, back_html)
         return CardResult(note_id=2, front=word, deck="Mock Manga")
 
@@ -140,10 +140,9 @@ async def main():
         f.write(HTML_TEMPLATE.format(anki_css=CSS))
 
     manager = MockAnkiManager(output_html_path)
-    sync_mgr = MockSyncManager()
 
     logger.info("Building agent...")
-    run_agent = build_agent(manager, sync_mgr)
+    run_agent = build_agent(manager)
 
     logger.info("Initialising panel detector...")
     detector = PanelDetector(device=settings.panel_model_device)
@@ -171,10 +170,22 @@ async def main():
             if result.pending_cards:
                 logger.info(f"Auto-accepting {len(result.pending_cards)} proposed cards")
                 for card in result.pending_cards:
+                    # Generate TTS for manga cards (same as bot.py does)
+                    audio_data = None
+                    if card.card_type == "manga" and card.sentence:
+                        try:
+                            import re
+                            from src.tts import generate_tts
+                            plain = re.sub(r"<[^>]+>", "", card.sentence)
+                            audio_data = generate_tts(plain)
+                            logger.info(f"  TTS generated: {len(audio_data)} bytes")
+                        except Exception as e:
+                            logger.warning(f"  TTS failed for '{card.word}': {e}")
                     manager.create_manga_card(
                         word=card.word, sentence=card.sentence,
                         translation=card.translation,
-                        image_data=card.image_data, tags=card.tags,
+                        image_data=card.image_data, reading=card.reading,
+                        audio_data=audio_data, tags=card.tags,
                     )
         except Exception as e:
             logger.exception(f"Error processing {img_path.name}: {e}")

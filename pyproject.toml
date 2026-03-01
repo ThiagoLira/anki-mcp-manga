@@ -32,6 +32,11 @@ panels-torch = [
     "matplotlib",
     "timm",
 ]
+tts = [
+    "kokoro-onnx",
+    "soundfile",
+    "misaki[ja]",
+]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",

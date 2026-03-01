@@ -104,8 +104,9 @@ def _card_caption(card: PendingCard) -> str:
             f"<b>Front:</b> {card.kanji}\n"
             f"<b>Back:</b> {card.reading} ({card.meaning})"
         )
+    reading_line = f"\n<b>Reading:</b> {card.reading}" if card.reading else ""
     return (
-        f"<b>Word:</b> {card.word}\n"
+        f"<b>Word:</b> {card.word}{reading_line}\n"
         f"<b>Sentence:</b> {card.sentence}\n"
         f"<b>Translation:</b> {card.translation}"
     )
@@ -154,6 +155,12 @@ async def _send_card_previews(
         session.msg_ids.append(bulk_msg.message_id)
 
 
+def _strip_html(text: str) -> str:
+    """Remove HTML tags from text for TTS input."""
+    import re
+    return re.sub(r"<[^>]+>", "", text)
+
+
 def _create_card(card: PendingCard) -> None:
     """Create the actual Anki card from a pending card."""
     if card.card_type == "kanji":
@@ -162,10 +169,20 @@ def _create_card(card: PendingCard) -> None:
             meaning=card.meaning, tags=card.tags,
         )
     else:
+        # Generate TTS audio from the Japanese sentence
+        audio_data = None
+        if card.sentence:
+            try:
+                from .tts import generate_tts
+                plain_sentence = _strip_html(card.sentence)
+                audio_data = generate_tts(plain_sentence)
+            except Exception as e:
+                logger.warning("TTS generation failed for '%s': %s", card.word, e)
         manager.create_manga_card(
             word=card.word, sentence=card.sentence,
             translation=card.translation,
-            image_data=card.image_data, tags=card.tags,
+            image_data=card.image_data, reading=card.reading,
+            audio_data=audio_data, tags=card.tags,
         )
 
 

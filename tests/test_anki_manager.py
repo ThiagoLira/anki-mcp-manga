@@ -46,15 +46,30 @@ class TestNoteTemplates:
         nt = ensure_manga_notetype(manager.col)
         assert nt["name"] == MANGA_NOTETYPE
         field_names = [f["name"] for f in nt["flds"]]
-        assert field_names == ["Word", "Sentence", "Image", "Translation"]
+        assert field_names == ["Word", "Sentence", "Image", "Translation", "Reading", "Audio"]
         assert len(nt["tmpls"]) == 1
         assert "{{Sentence}}" in nt["tmpls"][0]["qfmt"]
         assert "{{Translation}}" in nt["tmpls"][0]["afmt"]
+        assert "{{Reading}}" in nt["tmpls"][0]["afmt"]
+        assert "{{Audio}}" in nt["tmpls"][0]["afmt"]
 
     def test_notetypes_idempotent(self, manager):
         nt1 = ensure_kanji_notetype(manager.col)
         nt2 = ensure_kanji_notetype(manager.col)
         assert nt1["id"] == nt2["id"]
+
+    def test_manga_notetype_migration_adds_fields(self, manager):
+        """Ensure _ensure adds missing fields to existing notetypes."""
+        col = manager.col
+        # Create the notetype first
+        nt = ensure_manga_notetype(col)
+        original_id = nt["id"]
+        # Calling again should return the same notetype (with all fields)
+        nt2 = ensure_manga_notetype(col)
+        assert nt2["id"] == original_id
+        field_names = [f["name"] for f in nt2["flds"]]
+        assert "Reading" in field_names
+        assert "Audio" in field_names
 
 
 class TestKanjiCards:
@@ -161,6 +176,29 @@ class TestMangaCards:
         )
         note = manager.col.get_note(result.note_id)
         assert note["Image"] == ""
+
+    def test_reading_field(self, manager):
+        result = manager.create_manga_card(
+            word="規則",
+            sentence="<b>規則</b>を守れ",
+            translation="Follow the <b>rules</b>",
+            reading="きそく",
+        )
+        note = manager.col.get_note(result.note_id)
+        assert note["Reading"] == "きそく"
+
+    def test_audio_field(self, manager):
+        fake_wav = b"RIFF" + b"\x00" * 100  # fake WAV data
+        result = manager.create_manga_card(
+            word="声",
+            sentence="<b>声</b>が聞こえる",
+            translation="I can hear a <b>voice</b>",
+            reading="こえ",
+            audio_data=fake_wav,
+        )
+        note = manager.col.get_note(result.note_id)
+        assert note["Audio"].startswith("[sound:tts_")
+        assert note["Audio"].endswith(".wav]")
 
 
 class TestCollectionOps:

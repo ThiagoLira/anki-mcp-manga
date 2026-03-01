@@ -81,6 +81,8 @@ the correct cropped panel image.
 - When the user sends a manga screenshot, read the text in the image, pick out \
 interesting vocabulary, and propose manga vocab cards with the image attached.
 - The `word` field is just the bare vocabulary word (for search/identification).
+- The `reading` field is the hiragana reading of the target word (e.g. きそく for 規則). \
+Always provide this for manga cards.
 - The `sentence` field is the full Japanese sentence with the target word wrapped in <b> tags.
 - The `translation` field is the full sentence translation with the target word wrapped in <b> tags.
 - Respond in English.
@@ -115,13 +117,15 @@ def build_agent(manager: AnkiManager) -> RunAgent:
         word: str,
         sentence: str,
         translation: str,
+        reading: str = "",
         panel_number: int | None = None,
         attach_image: bool = True,
         tags: list[str] | None = None,
     ) -> str:
         """Propose a manga vocab flashcard for user review (not created in Anki yet).
         Front: manga image + Japanese sentence (target word in <b>bold</b>).
-        Back: full sentence translation (target word in <b>bold</b>).
+        Back: reading (hiragana) + full sentence translation (target word in <b>bold</b>) + audio.
+        Provide `reading` as the hiragana reading of the target word (e.g. きそく for 規則).
         Set panel_number (0-based) to attach the cropped panel image instead of the full page.
         Set attach_image=False to skip attaching any image."""
         image_bytes: bytes | None = None
@@ -133,7 +137,8 @@ def build_agent(manager: AnkiManager) -> RunAgent:
                 image_bytes = image_store.get("current")
         card = PendingCard(
             card_type="manga", word=word, sentence=sentence,
-            translation=translation, image_data=image_bytes, tags=tags,
+            translation=translation, reading=reading,
+            image_data=image_bytes, tags=tags,
         )
         pending_cards.append(card)
         panel_info = f" (panel {panel_number})" if panel_number is not None and image_bytes else ""
@@ -171,7 +176,8 @@ def build_agent(manager: AnkiManager) -> RunAgent:
     ) -> str:
         """Propose multiple manga vocab cards at once for user review (not created in Anki yet).
         cards_json is a JSON array of objects with keys:
-          word, sentence, translation, panel_number (optional, 0-based), tags (optional).
+          word, sentence, translation, reading (hiragana of word),
+          panel_number (optional, 0-based), tags (optional).
         sentence should have the target word in <b>bold</b>.
         translation should have the translated word in <b>bold</b>.
         Set attach_image=False to skip attaching images."""
@@ -194,6 +200,7 @@ def build_agent(manager: AnkiManager) -> RunAgent:
                     word=card["word"],
                     sentence=card["sentence"],
                     translation=card["translation"],
+                    reading=card.get("reading", ""),
                     image_data=image_bytes,
                     tags=card.get("tags"),
                 )

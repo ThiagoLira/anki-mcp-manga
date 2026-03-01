@@ -71,12 +71,14 @@ class AnkiManager:
         sentence: str,
         translation: str,
         image_data: bytes | None = None,
+        reading: str = "",
+        audio_data: bytes | None = None,
         tags: list[str] | None = None,
     ) -> CardResult:
         """Create a manga vocab card.
 
         Front: manga image + Japanese sentence (target word bolded).
-        Back: full sentence translation (target word bolded).
+        Back: reading + full sentence translation (target word bolded) + audio.
         """
         col = self.col
         notetype = ensure_manga_notetype(col)
@@ -86,10 +88,17 @@ class AnkiManager:
         note["Word"] = word
         note["Sentence"] = sentence
         note["Translation"] = translation
+        note["Reading"] = reading
 
         if image_data:
             filename = self._process_image(image_data)
             note["Image"] = f'<img src="{filename}">'
+
+        if audio_data:
+            audio_hash = hashlib.sha256(audio_data).hexdigest()[:12]
+            audio_filename = f"tts_{audio_hash}.wav"
+            col.media.write_data(audio_filename, audio_data)
+            note["Audio"] = f"[sound:{audio_filename}]"
 
         if tags:
             for tag in tags:
