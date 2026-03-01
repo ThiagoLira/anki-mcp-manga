@@ -1,9 +1,10 @@
 FROM python:3.11-slim
 
-# Image processing + TTS system deps
+# Image processing + TTS system deps + build tools (pyopenjtalk needs cmake/gcc)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libjpeg62-turbo-dev libwebp-dev zlib1g-dev \
     espeak-ng \
+    build-essential cmake \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
