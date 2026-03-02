@@ -187,11 +187,20 @@ def _create_card(card: PendingCard) -> None:
 
 
 async def _finalize_session(session_id: str, session: ReviewSession) -> None:
-    """Create accepted cards in Anki, sync, send summary, clean up."""
-    accepted = sum(1 for s in session.status if s is True)
+    """Pre-sync, create accepted cards in Anki, post-sync, send summary, clean up."""
+    accepted_indices = [i for i, s in enumerate(session.status) if s is True]
     deleted = sum(1 for s in session.status if s is False)
 
-    if accepted > 0:
+    if accepted_indices:
+        # Pre-sync: pull latest state so the local collection is up to date.
+        # This prevents FULL_UPLOAD from overwriting the server with a stale
+        # local collection that is missing the user's existing cards.
+        pre_result = sync_mgr.sync()
+        logger.info("Pre-sync before card creation: %s", pre_result["collection_sync"])
+
+        for i in accepted_indices:
+            _create_card(session.cards[i])
+
         sync_result = sync_mgr.sync()
         sync_info = f"\nSync: {sync_result['collection_sync']}"
     else:
@@ -199,7 +208,7 @@ async def _finalize_session(session_id: str, session: ReviewSession) -> None:
 
     await bot.send_message(
         session.chat_id,
-        f"Review complete: {accepted} accepted, {deleted} deleted.{sync_info}",
+        f"Review complete: {len(accepted_indices)} accepted, {deleted} deleted.{sync_info}",
     )
 
     del pending_reviews[session_id]
@@ -378,8 +387,6 @@ async def handle_card_review(callback: CallbackQuery) -> None:
         async with agent_lock:
             for i in remaining:
                 session.status[i] = accept
-                if accept:
-                    _create_card(session.cards[i])
                 # Update individual card message
                 status_text = "✅ Accepted" if accept else "❌ Deleted"
                 card = session.cards[i]
@@ -426,8 +433,6 @@ async def handle_card_review(callback: CallbackQuery) -> None:
 
     async with agent_lock:
         session.status[index] = accept
-        if accept:
-            _create_card(card)
 
     # Update the message to show result and remove keyboard
     status_text = "✅ Accepted" if accept else "❌ Deleted"

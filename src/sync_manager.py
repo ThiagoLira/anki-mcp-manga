@@ -67,6 +67,9 @@ class SyncManager:
             self._manager.reopen()
             result["collection_sync"] = "full_upload_forced"
 
+        # Re-fetch col after potential reopen (old reference is closed)
+        col = self._manager.col
+
         # Re-auth after potential reopen
         auth = col.sync_login(
             username=settings.sync_user,
