@@ -200,13 +200,13 @@ async def _finalize_session(session_id: str, session: ReviewSession) -> None:
         # Pre-sync: pull latest state so the local collection is up to date.
         # This prevents FULL_UPLOAD from overwriting the server with a stale
         # local collection that is missing the user's existing cards.
-        pre_result = sync_mgr.sync()
+        pre_result = sync_mgr.pull()
         logger.info("Pre-sync before card creation: %s", pre_result["collection_sync"])
 
         for i in accepted_indices:
             _create_card(session.cards[i])
 
-        sync_result = sync_mgr.sync()
+        sync_result = sync_mgr.push()
         sync_info = f"\nSync: {sync_result['collection_sync']}"
     else:
         sync_info = ""
