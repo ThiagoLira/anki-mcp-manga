@@ -120,10 +120,15 @@ def _card_keyboard(session_id: str, index: int) -> InlineKeyboardMarkup:
 
 
 def _bulk_keyboard(session_id: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Accept All", callback_data=f"mc:{session_id}:all:a"),
-        InlineKeyboardButton(text="❌ Delete All", callback_data=f"mc:{session_id}:all:d"),
-    ]])
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="✅ Accept All", callback_data=f"mc:{session_id}:all:a"),
+            InlineKeyboardButton(text="❌ Delete All", callback_data=f"mc:{session_id}:all:d"),
+        ],
+        [
+            InlineKeyboardButton(text="✅ Done — create accepted, skip rest", callback_data=f"mc:{session_id}:all:done"),
+        ],
+    ])
 
 
 async def _send_card_previews(
@@ -375,14 +380,46 @@ async def handle_card_review(callback: CallbackQuery) -> None:
         await callback.answer("Session expired.", show_alert=True)
         return
 
-    accept = action == "a"
-
     # --- Bulk action ---
     if index_str == "all":
         remaining = session.pending_indices
         if not remaining:
             await callback.answer("All cards already reviewed.")
             return
+
+        if action == "done":
+            # "Done" — skip all remaining cards, finalize with what was accepted
+            async with agent_lock:
+                for i in remaining:
+                    session.status[i] = False
+                    card = session.cards[i]
+                    caption = _card_caption(card) + "\n\n⏭ Skipped"
+                    msg_id = session.msg_ids[i]
+                    try:
+                        if card.image_data:
+                            await bot.edit_message_caption(
+                                chat_id=session.chat_id, message_id=msg_id,
+                                caption=caption, parse_mode="HTML",
+                            )
+                        else:
+                            await bot.edit_message_text(
+                                chat_id=session.chat_id, message_id=msg_id,
+                                text=caption, parse_mode="HTML",
+                            )
+                    except Exception:
+                        pass
+
+            try:
+                await callback.message.edit_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+
+            accepted = sum(1 for s in session.status if s is True)
+            await callback.answer(f"Skipped {len(remaining)}, creating {accepted} accepted cards.")
+            await _finalize_session(session_id, session)
+            return
+
+        accept = action == "a"
 
         async with agent_lock:
             for i in remaining:
@@ -420,6 +457,7 @@ async def handle_card_review(callback: CallbackQuery) -> None:
         return
 
     # --- Single card action ---
+    accept = action == "a"
     index = int(index_str)
     if index < 0 or index >= len(session.cards):
         await callback.answer("Invalid card index.")
