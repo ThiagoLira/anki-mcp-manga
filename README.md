@@ -123,6 +123,59 @@ On your phone or desktop Anki (must be on the same network, or use Tailscale):
 
 If you use Tailscale, the URL would be `http://100.x.x.x:8080` or `http://<machine>.<tailnet>.ts.net:8080`.
 
+## k3s Deployment (Kubernetes)
+
+The stack can run on k3s instead of plain Docker Compose. This is the setup used on the `teagolab-1` Tailnet server.
+
+### Initial setup
+
+Install k3s and configure kubectl:
+
+```bash
+curl -sfL https://get.k3s.io | sh -
+mkdir -p ~/.kube
+sudo cp /etc/rancher/k3s/k3s.yaml ~/.kube/config
+sudo chown $(id -u):$(id -g) ~/.kube/config
+echo 'export KUBECONFIG=~/.kube/config' >> ~/.bashrc
+```
+
+Create the namespace and secret from your `.env`:
+
+```bash
+kubectl create namespace anki
+kubectl create secret generic anki-env -n anki \
+  --from-env-file=.env
+```
+
+Build, import images, and deploy:
+
+```bash
+docker compose build
+docker save anki_mcp-anki-bot | sudo k3s ctr images import --all-platforms -
+docker save anki_mcp-anki-sync | sudo k3s ctr images import --all-platforms -
+kubectl apply -f k8s/anki.yaml
+```
+
+### Redeploy after changes
+
+From your dev machine:
+
+```bash
+ssh teagolab-1 "cd repos/anki_mcp && git pull && ./k8s/deploy.sh"
+```
+
+Or on the server directly:
+
+```bash
+cd ~/repos/anki_mcp
+git pull
+./k8s/deploy.sh
+```
+
+### Kubernetes Dashboard
+
+The dashboard is deployed at `https://teagolab-1:30443` (accessible from any Tailnet device). Login token is at `~/.kube/dashboard-token` on the server.
+
 ## Data Management
 
 ### Where data lives
