@@ -310,14 +310,27 @@ def sort_text_boxes_in_reading_order(
 
 _CIRCLED_NUMBERS = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳"
 
+# Fixed color progression — saturated, high-contrast against B&W manga
+_PANEL_COLORS = [
+    (255, 0, 0),       # ① Red
+    (0, 80, 255),      # ② Blue
+    (0, 180, 0),       # ③ Green
+    (255, 140, 0),     # ④ Orange
+    (160, 0, 200),     # ⑤ Purple
+    (0, 200, 200),     # ⑥ Cyan
+    (255, 0, 150),     # ⑦ Magenta
+    (200, 200, 0),     # ⑧ Yellow
+    (255, 100, 100),   # ⑨ Salmon
+    (0, 150, 100),     # ⑩ Teal
+]
+
 
 def _annotate_page(image: Image.Image, panel_bboxes: list[list[float]]) -> Image.Image:
-    """Draw circled panel numbers on the image."""
+    """Draw colored borders and labels on each panel for LLM identification."""
     annotated = image.copy().convert("RGB")
     draw = ImageDraw.Draw(annotated)
 
-    # Scale font to ~4% of image height
-    font_size = max(24, int(image.height * 0.04))
+    font_size = max(28, int(image.height * 0.06))
     try:
         font = ImageFont.truetype("/usr/share/fonts/noto-cjk/NotoSansCJK-Bold.ttc", font_size)
     except (OSError, IOError):
@@ -326,18 +339,27 @@ def _annotate_page(image: Image.Image, panel_bboxes: list[list[float]]) -> Image
         except (OSError, IOError):
             font = ImageFont.load_default()
 
-    for i, (x1, y1, x2, y2) in enumerate(panel_bboxes):
-        label = _CIRCLED_NUMBERS[i] if i < len(_CIRCLED_NUMBERS) else str(i + 1)
-        cx = (x1 + x2) / 2
-        cy = (y1 + y2) / 2
+    border_width = max(4, int(image.height * 0.005))
 
-        # Draw background circle
-        r = font_size * 0.7
-        draw.ellipse([cx - r, cy - r, cx + r, cy + r], fill=(0, 0, 0, 200))
-        # Draw text centered
-        bbox = draw.textbbox((0, 0), label, font=font)
-        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-        draw.text((cx - tw / 2, cy - th / 2), label, fill="white", font=font)
+    for i, (x1, y1, x2, y2) in enumerate(panel_bboxes):
+        color = _PANEL_COLORS[i % len(_PANEL_COLORS)]
+        label = _CIRCLED_NUMBERS[i] if i < len(_CIRCLED_NUMBERS) else str(i + 1)
+
+        # Draw thick colored border around the panel
+        for w in range(border_width):
+            draw.rectangle([x1 + w, y1 + w, x2 - w, y2 - w], outline=color)
+
+        # Label at top-right corner of panel (manga reads RTL)
+        text_bbox = draw.textbbox((0, 0), label, font=font)
+        tw, th = text_bbox[2] - text_bbox[0], text_bbox[3] - text_bbox[1]
+        pad = 6
+        lx = x2 - tw - pad * 2 - border_width
+        ly = y1 + border_width
+
+        # Solid background rectangle for the label
+        draw.rectangle([lx, ly, lx + tw + pad * 2, ly + th + pad * 2], fill=color)
+        # White text on colored background
+        draw.text((lx + pad, ly + pad), label, fill="white", font=font)
 
     return annotated
 
