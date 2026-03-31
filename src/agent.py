@@ -263,13 +263,19 @@ class CardAgent:
         summary = await self._summarize_page(page_analysis.annotated_image, caption)
         logger.info("Page summary:\n%s", summary)
 
-        # Step 2: extract per panel
+        # Step 2: extract per panel, tracking seen words to avoid duplicates
         all_cards: list[PendingCard] = []
         panel_texts: list[str] = []
-        prompt = PER_PANEL_PROMPT.format(summary=summary)
+        seen_words: set[str] = set()
+        base_prompt = PER_PANEL_PROMPT.format(summary=summary)
 
         for i, panel in enumerate(page_analysis.panels):
             logger.info("Extracting panel %d/%d", i + 1, len(page_analysis.panels))
+            if seen_words:
+                skip_line = "\n\nAlready extracted (do NOT repeat): " + ", ".join(sorted(seen_words))
+                prompt = base_prompt + skip_line
+            else:
+                prompt = base_prompt
             extraction = await self._extract_manga(
                 panel.image_bytes,
                 "Extract vocabulary from this panel and propose cards.",
@@ -278,6 +284,7 @@ class CardAgent:
             cards = self._build_manga_cards(extraction, {}, fallback_image=panel.image_bytes)
             all_cards.extend(cards)
             panel_texts.append(extraction.summary)
+            seen_words.update(c.word for c in cards)
 
         text = (
             f"Processed {len(page_analysis.panels)} panels.\n\n"
