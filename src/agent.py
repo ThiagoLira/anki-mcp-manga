@@ -88,10 +88,53 @@ Always provide this for manga cards.
 - Respond in English.
 """
 
+SUMMARY_PROMPT = """\
+You are a Japanese language expert analyzing a manga page. The image shows \
+a full manga page with panels numbered ①②③... in manga reading order \
+(right-to-left, top-to-bottom), each outlined with a distinct color.
+
+Provide a concise summary of what is happening on this page:
+1. Transcribe ALL dialogue for each panel, referencing panel numbers.
+2. Summarize the narrative: who is speaking, what is happening, the emotional context.
+
+This summary will be used as context when processing individual panels for \
+vocabulary extraction, so include any details that help understand dialogue \
+in isolation (e.g. implied subjects, who is being addressed)."""
+
+PER_PANEL_PROMPT = """\
+You are a Japanese language study assistant that creates Anki flashcards.
+You have tools to propose manga vocab cards for user review.
+
+## Manga vocab cards (deck: Japones Vocab Mangas)
+Context-rich cards with:
+- Front: manga panel screenshot + Japanese sentence with the target word in <b>bold</b>
+- Back: full sentence translation with the translated target word in <b>bold</b>
+
+Example: if the word is 規則 from the sentence 規則を守れ:
+- sentence: "<b>規則</b>を守れ"
+- translation: "Follow the <b>rules</b>"
+
+## Guidelines
+- The image shows a single manga panel. Extract interesting vocabulary from it.
+- The `word` field is just the bare vocabulary word (for search/identification).
+- The `reading` field is the hiragana reading of the target word (e.g. きそく for 規則). \
+Always provide this.
+- The `sentence` field is the full Japanese sentence with the target word wrapped in <b> tags.
+- The `translation` field is the full sentence translation with the target word wrapped in <b> tags.
+- Do NOT set panel_number — the image is already the correct panel.
+- Use the page context below to understand implied subjects or references to other panels.
+- Respond in English.
+
+## Page context
+{summary}"""
+
 RunAgent = Callable[[str, bytes | None, "PageAnalysis | None"], Coroutine[Any, Any, AgentResult]]
+RunMultiPanel = Callable[
+    [str, bytes, "PageAnalysis"], Coroutine[Any, Any, AgentResult]
+]
 
 
-def build_agent(manager: AnkiManager) -> RunAgent:
+def build_agent(manager: AnkiManager) -> tuple[RunAgent, RunMultiPanel]:
     """Build the LangGraph ReAct agent with tools bound to the given managers."""
 
     # Mutable dict to hold current image bytes — tools read from here
@@ -302,4 +345,55 @@ def build_agent(manager: AnkiManager) -> RunAgent:
         text = ai_messages[-1].content if ai_messages else "Done."
         return AgentResult(text=text, pending_cards=list(pending_cards))
 
-    return run_agent
+    async def run_multi_panel(
+        text: str,
+        image_bytes: bytes,
+        page_analysis: PageAnalysis,
+    ) -> AgentResult:
+        """Process a many-panel page: summarise the full page, then extract cards per panel."""
+        pending_cards.clear()
+
+        # --- Step 1: Get a narrative summary from the full annotated page ---
+        b64_full = base64.b64encode(page_analysis.annotated_image).decode()
+        summary_message = HumanMessage(content=[
+            {
+                "type": "image_url",
+                "image_url": {"url": f"data:image/webp;base64,{b64_full}"},
+            },
+            {"type": "text", "text": text},
+        ])
+        summary_result = await llm.ainvoke(
+            [{"role": "system", "content": SUMMARY_PROMPT}, summary_message]
+        )
+        summary = summary_result.content
+        logger.info("Multi-panel summary: %s", summary[:200])
+
+        # --- Step 2: Process each panel individually with the summary as context ---
+        per_panel_agent = create_react_agent(
+            llm, tools, prompt=PER_PANEL_PROMPT.format(summary=summary),
+        )
+
+        panel_texts: list[str] = []
+        for panel in page_analysis.panels:
+            # Set image_store so tools attach this panel's image
+            image_store["current"] = panel.image_bytes
+            image_store.pop("panels", None)
+
+            b64_panel = base64.b64encode(panel.image_bytes).decode()
+            panel_message = HumanMessage(content=[
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/webp;base64,{b64_panel}"},
+                },
+                {"type": "text", "text": "Extract vocabulary from this panel and propose cards."},
+            ])
+
+            result = await per_panel_agent.ainvoke({"messages": [panel_message]})
+            ai_msgs = [m for m in result["messages"] if m.type == "ai" and m.content]
+            if ai_msgs:
+                panel_texts.append(ai_msgs[-1].content)
+
+        combined_text = f"Processed {len(page_analysis.panels)} panels.\n\n" + "\n\n".join(panel_texts)
+        return AgentResult(text=combined_text, pending_cards=list(pending_cards))
+
+    return run_agent, run_multi_panel

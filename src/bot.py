@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 manager = AnkiManager()
 sync_mgr = SyncManager(manager)
-run_agent = build_agent(manager)
+run_agent, run_multi_panel = build_agent(manager)
 
 # Lazy panel detector — only initialised when first image arrives
 _panel_detector = None
@@ -304,10 +304,22 @@ async def handle_photo(message: Message) -> None:
             page_analysis = None
         await processing.delete()
 
-    processing = await message.answer("Processing image...")
+    # Branch on panel count: ≥5 panels uses multi-panel flow (summary + per-panel)
+    use_multi = page_analysis is not None and len(page_analysis.panels) >= 5
+
+    if use_multi:
+        processing = await message.answer(
+            f"Processing {len(page_analysis.panels)} panels (summarising page, then extracting per panel)..."
+        )
+    else:
+        processing = await message.answer("Processing image...")
+
     async with agent_lock:
         try:
-            result = await run_agent(caption, image_bytes, page_analysis)
+            if use_multi:
+                result = await run_multi_panel(caption, image_bytes, page_analysis)
+            else:
+                result = await run_agent(caption, image_bytes, page_analysis)
         except Exception as e:
             logger.exception("Agent error")
             await processing.delete()
