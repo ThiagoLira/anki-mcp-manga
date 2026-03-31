@@ -1,24 +1,27 @@
 from __future__ import annotations
 
 import base64
-import json
 import logging
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable, Coroutine
+from typing import TYPE_CHECKING, Any
 
-from langchain_core.messages import HumanMessage
-from langchain_core.tools import tool
+from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
-from langgraph.prebuilt import create_react_agent
+from pydantic import BaseModel, Field
 
 from .config import settings
 
 if TYPE_CHECKING:
-    from .anki_manager import AnkiManager
     from .panel_detector import PageAnalysis
 
 logger = logging.getLogger(__name__)
 
+MULTI_PANEL_THRESHOLD = 5
+
+
+# ---------------------------------------------------------------------------
+# Data structures (kept for bot.py review flow)
+# ---------------------------------------------------------------------------
 
 @dataclass
 class PendingCard:
@@ -42,358 +45,294 @@ class AgentResult:
     text: str
     pending_cards: list[PendingCard] = field(default_factory=list)
 
-SYSTEM_PROMPT = """\
-You are a Japanese language study assistant that creates Anki flashcards.
-You have tools to propose two types of cards for user review:
 
-## Kanji cards (deck: Japones KANJI)
-For learning kanji and vocabulary words:
-- Front: the kanji or word
-- Back: reading (hiragana) + meaning
-Use propose_kanji_card for individual cards, propose_kanji_cards_batch for multiple.
-These tools PROPOSE cards for user review — they are NOT created in Anki yet.
+# ---------------------------------------------------------------------------
+# Structured output schemas
+# ---------------------------------------------------------------------------
 
-## Manga vocab cards (deck: Japones Vocab Mangas)
-For vocabulary extracted from manga pages. These are context-rich cards:
-- Front: manga panel screenshot + Japanese sentence with the target word in <b>bold</b>
-- Back: full sentence translation with the translated target word in <b>bold</b>
+class MangaProposal(BaseModel):
+    """A proposed manga vocabulary flashcard."""
+    word: str = Field(description="The bare vocabulary word (e.g. 規則)")
+    reading: str = Field(description="Hiragana reading of the word (e.g. きそく)")
+    sentence: str = Field(
+        description="Full Japanese sentence with target word in <b> tags "
+        '(e.g. "<b>規則</b>を守れ")'
+    )
+    translation: str = Field(
+        description="Full sentence translation with translated word in <b> tags "
+        '(e.g. "Follow the <b>rules</b>")'
+    )
+    panel_number: int | None = Field(
+        None, description="0-based panel index matching the ①②③ labels"
+    )
 
-Example: if the word is 規則 from the sentence 規則を守れ:
-- sentence: "<b>規則</b>を守れ"
-- translation: "Follow the <b>rules</b>"
 
-Use propose_manga_card for individual cards, propose_manga_cards_batch for multiple.
-These tools PROPOSE cards for user review — they are NOT created in Anki yet.
+class MangaExtraction(BaseModel):
+    """Vocabulary extracted from a manga page or panel."""
+    summary: str = Field(description="Brief transcription and narrative summary")
+    cards: list[MangaProposal] = Field(description="Proposed vocabulary cards")
 
-## Panel-based workflow
-When panels are detected, the image you see has panels numbered ①②③... in manga \
-reading order (right-to-left, top-to-bottom). Each card will be attached with the \
-cropped panel image instead of the full page.
+
+class KanjiProposal(BaseModel):
+    """A proposed kanji/vocab flashcard."""
+    kanji: str = Field(description="The kanji or vocabulary word")
+    reading: str = Field(description="Hiragana reading")
+    meaning: str = Field(description="English meaning")
+
+
+class TextResponse(BaseModel):
+    """Response to a text-only request."""
+    response: str = Field(description="Text response to the user")
+    kanji_cards: list[KanjiProposal] = Field(
+        default_factory=list, description="Proposed kanji cards, if requested"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Prompts
+# ---------------------------------------------------------------------------
+
+MANGA_PROMPT = """\
+You are a Japanese language study assistant that creates Anki flashcards \
+from manga pages.
+
+When panels are detected, the image has panels numbered ①②③... in manga \
+reading order (right-to-left, top-to-bottom).
 
 Follow this two-pass process:
-1. **Transcribe first**: Read ALL dialogue in the image, referencing panel numbers \
+1. **Transcribe first**: Read ALL dialogue, referencing panel numbers \
 ①②③... to establish full context and reading order.
-2. **Create cards**: Extract interesting vocabulary and propose cards. For each card, \
-specify `panel_number` (0-based index matching the ①②③ labels) so the card gets \
-the correct cropped panel image.
+2. **Create cards**: Extract interesting vocabulary at or above JLPT N4 level. \
+Skip basic N5/N4 words (e.g. 食べる, 大きい, 学校) — the user already knows those.
 
-## Guidelines
-- When the user sends a manga screenshot, read the text in the image, pick out \
-interesting vocabulary, and propose manga vocab cards with the image attached.
-- The `word` field is just the bare vocabulary word (for search/identification).
-- The `reading` field is the hiragana reading of the target word (e.g. きそく for 規則). \
-Always provide this for manga cards.
-- The `sentence` field is the full Japanese sentence with the target word wrapped in <b> tags.
-- The `translation` field is the full sentence translation with the target word wrapped in <b> tags.
-- Respond in English.
-"""
+For each card, provide:
+- `word`: the bare vocabulary word
+- `reading`: hiragana reading (e.g. きそく for 規則)
+- `sentence`: full Japanese sentence with target word in <b>bold</b>
+- `translation`: full sentence translation with translated word in <b>bold</b>
+- `panel_number`: 0-based index matching the ①②③ labels (when panels are visible)
+
+Write a brief `summary` covering transcription and narrative context.
+Respond in English."""
 
 SUMMARY_PROMPT = """\
-You are a Japanese language expert analyzing a manga page. The image shows \
-a full manga page with panels numbered ①②③... in manga reading order \
-(right-to-left, top-to-bottom), each outlined with a distinct color.
+You are a Japanese language expert. The image shows a manga page with panels \
+numbered ①②③... in reading order (right-to-left, top-to-bottom).
 
-Provide a concise summary of what is happening on this page:
-1. Transcribe ALL dialogue for each panel, referencing panel numbers.
-2. Summarize the narrative: who is speaking, what is happening, the emotional context.
+Provide a concise summary:
+1. Transcribe ALL dialogue per panel.
+2. Summarize the narrative: who speaks, what happens, emotional context.
 
-This summary will be used as context when processing individual panels for \
-vocabulary extraction, so include any details that help understand dialogue \
-in isolation (e.g. implied subjects, who is being addressed)."""
+This will be used as context for per-panel vocabulary extraction."""
 
 PER_PANEL_PROMPT = """\
 You are a Japanese language study assistant that creates Anki flashcards.
-You have tools to propose manga vocab cards for user review.
 
-## Manga vocab cards (deck: Japones Vocab Mangas)
-Context-rich cards with:
-- Front: manga panel screenshot + Japanese sentence with the target word in <b>bold</b>
-- Back: full sentence translation with the translated target word in <b>bold</b>
+Extract interesting vocabulary from this single manga panel. \
+Skip basic JLPT N5/N4 words — the user already knows those. Focus on N3+ vocabulary.
 
-Example: if the word is 規則 from the sentence 規則を守れ:
-- sentence: "<b>規則</b>を守れ"
-- translation: "Follow the <b>rules</b>"
+For each card, provide:
+- `word`: the bare vocabulary word
+- `reading`: hiragana reading
+- `sentence`: full Japanese sentence with target word in <b>bold</b>
+- `translation`: full sentence translation with translated word in <b>bold</b>
 
-## Guidelines
-- The image shows a single manga panel. Extract interesting vocabulary from it.
-- The `word` field is just the bare vocabulary word (for search/identification).
-- The `reading` field is the hiragana reading of the target word (e.g. きそく for 規則). \
-Always provide this.
-- The `sentence` field is the full Japanese sentence with the target word wrapped in <b> tags.
-- The `translation` field is the full sentence translation with the target word wrapped in <b> tags.
-- Do NOT set panel_number — the image is already the correct panel.
-- Use the page context below to understand implied subjects or references to other panels.
-- Respond in English.
+Do NOT set panel_number — the image is already the correct panel.
+Use the page context below to understand implied subjects or references.
 
 ## Page context
 {summary}"""
 
-RunAgent = Callable[[str, bytes | None, "PageAnalysis | None"], Coroutine[Any, Any, AgentResult]]
-RunMultiPanel = Callable[
-    [str, bytes, "PageAnalysis"], Coroutine[Any, Any, AgentResult]
-]
+TEXT_PROMPT = """\
+You are a Japanese language study assistant that creates Anki flashcards.
+If the user asks to create kanji/vocab cards, include them in kanji_cards.
+Otherwise, just respond helpfully about Japanese language topics.
+Respond in English."""
 
 
-def build_agent(manager: AnkiManager) -> tuple[RunAgent, RunMultiPanel]:
-    """Build the LangGraph ReAct agent with tools bound to the given managers."""
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-    # Mutable dict to hold current image bytes — tools read from here
-    image_store: dict[str, Any] = {}
-    # Accumulates proposed manga cards during a single run
-    pending_cards: list[PendingCard] = []
+def _image_data_uri(image_bytes: bytes) -> str:
+    """Build a base64 data URI with correct MIME type."""
+    b64 = base64.b64encode(image_bytes).decode()
+    if image_bytes[:4] == b"RIFF" and image_bytes[8:12] == b"WEBP":
+        mime = "image/webp"
+    elif image_bytes[:2] == b"\xff\xd8":
+        mime = "image/jpeg"
+    elif image_bytes[:8] == b"\x89PNG\r\n\x1a\n":
+        mime = "image/png"
+    else:
+        mime = "image/webp"
+    return f"data:{mime};base64,{b64}"
 
-    @tool
-    def propose_kanji_card(
-        kanji: str, reading: str, meaning: str, tags: list[str] | None = None
-    ) -> str:
-        """Propose a kanji/vocab flashcard for user review (not created in Anki yet).
-        Front: kanji. Back: reading + meaning."""
-        card = PendingCard(
-            card_type="kanji", kanji=kanji, reading=reading,
-            meaning=meaning, tags=tags,
-        )
-        pending_cards.append(card)
-        return f"Proposed kanji card: {kanji}"
 
-    @tool
-    def propose_manga_card(
-        word: str,
-        sentence: str,
-        translation: str,
-        reading: str = "",
-        panel_number: int | None = None,
-        attach_image: bool = True,
-        tags: list[str] | None = None,
-    ) -> str:
-        """Propose a manga vocab flashcard for user review (not created in Anki yet).
-        Front: manga image + Japanese sentence (target word in <b>bold</b>).
-        Back: reading (hiragana) + full sentence translation (target word in <b>bold</b>) + audio.
-        Provide `reading` as the hiragana reading of the target word (e.g. きそく for 規則).
-        Set panel_number (0-based) to attach the cropped panel image instead of the full page.
-        Set attach_image=False to skip attaching any image."""
-        image_bytes: bytes | None = None
-        if attach_image:
-            panels = image_store.get("panels")
-            if panel_number is not None and panels and 0 <= panel_number < len(panels):
-                image_bytes = panels[panel_number]
-            else:
-                image_bytes = image_store.get("current")
-        card = PendingCard(
-            card_type="manga", word=word, sentence=sentence,
-            translation=translation, reading=reading,
-            image_data=image_bytes, tags=tags,
-        )
-        pending_cards.append(card)
-        panel_info = f" (panel {panel_number})" if panel_number is not None and image_bytes else ""
-        img_status = f" with image{panel_info}" if image_bytes else ""
-        return f"Proposed manga card: {word}{img_status}"
-
-    @tool
-    def propose_kanji_cards_batch(cards_json: str) -> str:
-        """Propose multiple kanji cards at once for user review (not created in Anki yet).
-        cards_json is a JSON array of objects with keys: kanji, reading, meaning, tags (optional)."""
-        cards = json.loads(cards_json)
-        proposed = []
-        errors = []
-        for i, card_data in enumerate(cards):
-            try:
-                card = PendingCard(
-                    card_type="kanji",
-                    kanji=card_data["kanji"],
-                    reading=card_data["reading"],
-                    meaning=card_data["meaning"],
-                    tags=card_data.get("tags"),
-                )
-                pending_cards.append(card)
-                proposed.append(card.kanji)
-            except Exception as e:
-                errors.append(f"Card {i} ({card_data.get('kanji', '?')}): {e}")
-        msg = f"Proposed {len(proposed)} kanji cards: {', '.join(proposed)}"
-        if errors:
-            msg += f"\nErrors: {'; '.join(errors)}"
-        return msg
-
-    @tool
-    def propose_manga_cards_batch(
-        cards_json: str, attach_image: bool = True
-    ) -> str:
-        """Propose multiple manga vocab cards at once for user review (not created in Anki yet).
-        cards_json is a JSON array of objects with keys:
-          word, sentence, translation, reading (hiragana of word),
-          panel_number (optional, 0-based), tags (optional).
-        sentence should have the target word in <b>bold</b>.
-        translation should have the translated word in <b>bold</b>.
-        Set attach_image=False to skip attaching images."""
-        cards = json.loads(cards_json)
-        panels = image_store.get("panels")
-        fallback_image = image_store.get("current")
-        proposed = []
-        errors = []
-        for i, card in enumerate(cards):
-            try:
-                image_bytes: bytes | None = None
-                if attach_image:
-                    pn = card.get("panel_number")
-                    if pn is not None and panels and 0 <= pn < len(panels):
-                        image_bytes = panels[pn]
-                    else:
-                        image_bytes = fallback_image
-                pending = PendingCard(
-                    card_type="manga",
-                    word=card["word"],
-                    sentence=card["sentence"],
-                    translation=card["translation"],
-                    reading=card.get("reading", ""),
-                    image_data=image_bytes,
-                    tags=card.get("tags"),
-                )
-                pending_cards.append(pending)
-                proposed.append(pending.word)
-            except Exception as e:
-                errors.append(f"Card {i} ({card.get('word', '?')}): {e}")
-        msg = f"Proposed {len(proposed)} manga cards: {', '.join(proposed)}"
-        if errors:
-            msg += f"\nErrors: {'; '.join(errors)}"
-        return msg
-
-    @tool
-    def search_notes(query: str) -> str:
-        """Search for existing notes using Anki search syntax.
-        Examples: 'deck:Japones KANJI', 'tag:manga', or free text like 'eat'."""
-        results = manager.search_notes(query)
-        if not results:
-            return "No notes found."
-        lines = []
-        for r in results:
-            fields = ", ".join(f"{k}={v}" for k, v in r["fields"].items() if v)
-            lines.append(f"[{r['id']}] {fields} tags={r['tags']}")
-        return "\n".join(lines)
-
-    @tool
-    def list_decks() -> str:
-        """List all decks in the Anki collection with note counts."""
-        decks = manager.list_decks()
-        if not decks:
-            return "No decks found."
-        return "\n".join(f"- {d['name']}: {d['note_count']} notes" for d in decks)
-
-    tools = [
-        propose_kanji_card,
-        propose_manga_card,
-        propose_kanji_cards_batch,
-        propose_manga_cards_batch,
-        search_notes,
-        list_decks,
+def _image_content(image_bytes: bytes, text: str) -> list[dict[str, Any]]:
+    """Build a multimodal message content list (image + text)."""
+    return [
+        {"type": "image_url", "image_url": {"url": _image_data_uri(image_bytes)}},
+        {"type": "text", "text": text},
     ]
 
-    llm = ChatOpenAI(
-        model=settings.openrouter_model,
-        base_url="https://openrouter.ai/api/v1",
-        api_key=settings.openrouter_api_key,
-    )
 
-    agent = create_react_agent(llm, tools, prompt=SYSTEM_PROMPT)
+# ---------------------------------------------------------------------------
+# CardAgent
+# ---------------------------------------------------------------------------
 
-    async def run_agent(
-        text: str,
-        image_bytes: bytes | None = None,
+class CardAgent:
+    """Orchestrates LLM calls for manga vocabulary extraction and card creation."""
+
+    def __init__(self) -> None:
+        self._llm = ChatOpenAI(
+            model=settings.openrouter_model,
+            base_url="https://openrouter.ai/api/v1",
+            api_key=settings.openrouter_api_key,
+        )
+
+    async def process_image(
+        self,
+        caption: str,
+        image_bytes: bytes,
         page_analysis: PageAnalysis | None = None,
     ) -> AgentResult:
-        """Run the agent with a user message, optionally including an image.
+        """Process a manga image and extract vocabulary cards."""
+        n_panels = len(page_analysis.panels) if page_analysis else 0
+        logger.info(
+            "process_image: caption=%d chars, image=%d bytes, panels=%d",
+            len(caption), len(image_bytes), n_panels,
+        )
 
-        When page_analysis is provided, the annotated image (with panel numbers)
-        is sent to the LLM, and cropped panels are stored for card attachment.
-        """
-        # Clear pending cards from any previous run
-        pending_cards.clear()
+        if page_analysis and n_panels >= MULTI_PANEL_THRESHOLD:
+            logger.info("Using multi-panel path (>= %d panels)", MULTI_PANEL_THRESHOLD)
+            return await self._multi_panel(caption, image_bytes, page_analysis)
 
-        # Determine which image the LLM sees vs. what gets attached to cards
-        if page_analysis:
-            # LLM sees annotated image with ①②③ labels
-            llm_image = page_analysis.annotated_image
-            # Cards get clean cropped panels
-            image_store["panels"] = [p.image_bytes for p in page_analysis.panels]
-            image_store["current"] = image_bytes  # fallback: original image
-        elif image_bytes:
-            llm_image = image_bytes
-            image_store["current"] = image_bytes
-            image_store.pop("panels", None)
-        else:
-            llm_image = None
-            image_store.pop("current", None)
-            image_store.pop("panels", None)
+        logger.info("Using single-pass path")
+        return await self._single_pass(caption, image_bytes, page_analysis)
 
-        # Build the message content
-        content: list[dict[str, Any]] = []
-        if llm_image:
-            b64 = base64.b64encode(llm_image).decode()
-            content.append(
-                {
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/webp;base64,{b64}"},
-                }
+    async def process_text(self, text: str) -> AgentResult:
+        """Handle a text-only message (kanji cards, questions)."""
+        logger.info("process_text: %s", text[:100])
+        llm = self._llm.with_structured_output(TextResponse)
+        result = await llm.ainvoke([
+            SystemMessage(content=TEXT_PROMPT),
+            HumanMessage(content=text),
+        ])
+        logger.info(
+            "process_text: response=%d chars, kanji_cards=%d",
+            len(result.response), len(result.kanji_cards),
+        )
+        cards = [
+            PendingCard(
+                card_type="kanji",
+                kanji=c.kanji, reading=c.reading, meaning=c.meaning,
             )
-        if text:
-            content.append({"type": "text", "text": text})
+            for c in result.kanji_cards
+        ]
+        return AgentResult(text=result.response, pending_cards=cards)
 
-        message = HumanMessage(content=content if len(content) > 1 else text or "")
+    # --- Private: processing paths ---
 
-        result = await agent.ainvoke({"messages": [message]})
+    async def _single_pass(
+        self,
+        caption: str,
+        image_bytes: bytes,
+        page_analysis: PageAnalysis | None,
+    ) -> AgentResult:
+        """Single LLM call for a full page (<= threshold panels)."""
+        if page_analysis:
+            llm_image = page_analysis.annotated_image
+            panels = {i: p.image_bytes for i, p in enumerate(page_analysis.panels)}
+        else:
+            llm_image = image_bytes
+            panels = {}
 
-        # Extract the last AI message
-        ai_messages = [m for m in result["messages"] if m.type == "ai" and m.content]
-        text = ai_messages[-1].content if ai_messages else "Done."
-        return AgentResult(text=text, pending_cards=list(pending_cards))
+        extraction = await self._extract_manga(llm_image, caption, MANGA_PROMPT)
+        cards = self._build_manga_cards(extraction, panels, fallback_image=image_bytes)
+        logger.info("single_pass complete: %d cards", len(cards))
+        return AgentResult(text=extraction.summary, pending_cards=cards)
 
-    async def run_multi_panel(
-        text: str,
+    async def _multi_panel(
+        self,
+        caption: str,
         image_bytes: bytes,
         page_analysis: PageAnalysis,
     ) -> AgentResult:
-        """Process a many-panel page: summarise the full page, then extract cards per panel."""
-        pending_cards.clear()
+        """Summary + per-panel extraction for pages with many panels."""
+        # Step 1: summarise the full page
+        summary = await self._summarize_page(page_analysis.annotated_image, caption)
+        logger.info("Page summary:\n%s", summary)
 
-        # --- Step 1: Get a narrative summary from the full annotated page ---
-        b64_full = base64.b64encode(page_analysis.annotated_image).decode()
-        summary_message = HumanMessage(content=[
-            {
-                "type": "image_url",
-                "image_url": {"url": f"data:image/webp;base64,{b64_full}"},
-            },
-            {"type": "text", "text": text},
-        ])
-        summary_result = await llm.ainvoke(
-            [{"role": "system", "content": SUMMARY_PROMPT}, summary_message]
-        )
-        summary = summary_result.content
-        logger.info("Multi-panel summary: %s", summary[:200])
-
-        # --- Step 2: Process each panel individually with the summary as context ---
-        per_panel_agent = create_react_agent(
-            llm, tools, prompt=PER_PANEL_PROMPT.format(summary=summary),
-        )
-
+        # Step 2: extract per panel
+        all_cards: list[PendingCard] = []
         panel_texts: list[str] = []
-        for panel in page_analysis.panels:
-            # Set image_store so tools attach this panel's image
-            image_store["current"] = panel.image_bytes
-            image_store.pop("panels", None)
+        prompt = PER_PANEL_PROMPT.format(summary=summary)
 
-            b64_panel = base64.b64encode(panel.image_bytes).decode()
-            panel_message = HumanMessage(content=[
-                {
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/webp;base64,{b64_panel}"},
-                },
-                {"type": "text", "text": "Extract vocabulary from this panel and propose cards."},
-            ])
+        for i, panel in enumerate(page_analysis.panels):
+            logger.info("Extracting panel %d/%d", i + 1, len(page_analysis.panels))
+            extraction = await self._extract_manga(
+                panel.image_bytes,
+                "Extract vocabulary from this panel and propose cards.",
+                prompt,
+            )
+            cards = self._build_manga_cards(extraction, {}, fallback_image=panel.image_bytes)
+            all_cards.extend(cards)
+            panel_texts.append(extraction.summary)
 
-            result = await per_panel_agent.ainvoke({"messages": [panel_message]})
-            ai_msgs = [m for m in result["messages"] if m.type == "ai" and m.content]
-            if ai_msgs:
-                panel_texts.append(ai_msgs[-1].content)
+        text = (
+            f"Processed {len(page_analysis.panels)} panels.\n\n"
+            + "\n\n".join(panel_texts)
+        )
+        logger.info("multi_panel complete: %d cards total", len(all_cards))
+        return AgentResult(text=text, pending_cards=all_cards)
 
-        combined_text = f"Processed {len(page_analysis.panels)} panels.\n\n" + "\n\n".join(panel_texts)
-        return AgentResult(text=combined_text, pending_cards=list(pending_cards))
+    # --- Private: LLM calls ---
 
-    return run_agent, run_multi_panel
+    async def _extract_manga(
+        self, image: bytes, user_text: str, system_prompt: str,
+    ) -> MangaExtraction:
+        """Send image + text to LLM and get structured manga extraction."""
+        llm = self._llm.with_structured_output(MangaExtraction)
+        result = await llm.ainvoke([
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=_image_content(image, user_text)),
+        ])
+        words = [c.word for c in result.cards]
+        logger.info("extract_manga: %d cards [%s]", len(result.cards), ", ".join(words))
+        return result
+
+    async def _summarize_page(self, annotated_image: bytes, caption: str) -> str:
+        """Get a narrative summary of the full annotated page."""
+        result = await self._llm.ainvoke([
+            SystemMessage(content=SUMMARY_PROMPT),
+            HumanMessage(content=_image_content(annotated_image, caption)),
+        ])
+        return result.content
+
+    # --- Private: card building ---
+
+    @staticmethod
+    def _build_manga_cards(
+        extraction: MangaExtraction,
+        panels: dict[int, bytes],
+        fallback_image: bytes,
+    ) -> list[PendingCard]:
+        """Convert structured extraction into PendingCards with correct images."""
+        cards: list[PendingCard] = []
+        for proposal in extraction.cards:
+            pn = proposal.panel_number
+            if panels and pn is not None and pn in panels:
+                image = panels[pn]
+                logger.info("  card '%s': using panel %d image", proposal.word, pn)
+            else:
+                image = fallback_image
+                logger.info("  card '%s': using fallback image", proposal.word)
+            cards.append(PendingCard(
+                card_type="manga",
+                word=proposal.word,
+                reading=proposal.reading,
+                sentence=proposal.sentence,
+                translation=proposal.translation,
+                image_data=image,
+            ))
+        return cards

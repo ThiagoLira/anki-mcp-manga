@@ -8,7 +8,7 @@ from PIL import Image
 
 # Important: this loads .env and its credentials under the hood
 from src.config import settings
-from src.agent import AgentResult, PendingCard, build_agent
+from src.agent import AgentResult, CardAgent, PendingCard
 from src.anki_manager import CardResult
 from src.note_templates import CSS
 from src.panel_detector import PanelDetector
@@ -142,7 +142,7 @@ async def main():
     manager = MockAnkiManager(output_html_path)
 
     logger.info("Building agent...")
-    run_agent = build_agent(manager)
+    card_agent = CardAgent()
 
     logger.info("Initialising panel detector...")
     detector = PanelDetector(device=settings.panel_model_device)
@@ -163,7 +163,7 @@ async def main():
         try:
             page_analysis = detector.detect(image_bytes)
             logger.info(f"Detected {len(page_analysis.panels)} panels in {img_path.name}")
-            result = await run_agent(prompt, image_bytes, page_analysis)
+            result = await card_agent.process_image(prompt, image_bytes, page_analysis)
             logger.info(f"Agent response for {img_path.name}: {result.text}")
 
             # Auto-accept all proposed cards (create them via the mock manager)

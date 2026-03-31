@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import io
 import logging
 import secrets
 import time
@@ -16,7 +15,7 @@ from aiogram.types import (
     Message,
 )
 
-from .agent import PendingCard, build_agent
+from .agent import CardAgent, PendingCard
 from .anki_manager import AnkiManager
 from .config import settings
 from .sync_manager import SyncManager
@@ -25,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 manager = AnkiManager()
 sync_mgr = SyncManager(manager)
-run_agent, run_multi_panel = build_agent(manager)
+agent = CardAgent()
 
 # Lazy panel detector — only initialised when first image arrives
 _panel_detector = None
@@ -304,22 +303,17 @@ async def handle_photo(message: Message) -> None:
             page_analysis = None
         await processing.delete()
 
-    # Branch on panel count: ≥5 panels uses multi-panel flow (summary + per-panel)
-    use_multi = page_analysis is not None and len(page_analysis.panels) >= 5
-
-    if use_multi:
+    n_panels = len(page_analysis.panels) if page_analysis else 0
+    if page_analysis and n_panels >= 5:
         processing = await message.answer(
-            f"Processing {len(page_analysis.panels)} panels (summarising page, then extracting per panel)..."
+            f"Processing {n_panels} panels (summarising page, then extracting per panel)..."
         )
     else:
         processing = await message.answer("Processing image...")
 
     async with agent_lock:
         try:
-            if use_multi:
-                result = await run_multi_panel(caption, image_bytes, page_analysis)
-            else:
-                result = await run_agent(caption, image_bytes, page_analysis)
+            result = await agent.process_image(caption, image_bytes, page_analysis)
         except Exception as e:
             logger.exception("Agent error")
             await processing.delete()
@@ -354,7 +348,7 @@ async def handle_text(message: Message) -> None:
     processing = await message.answer("Thinking...")
     async with agent_lock:
         try:
-            result = await run_agent(message.text)
+            result = await agent.process_text(message.text)
         except Exception as e:
             logger.exception("Agent error")
             await processing.delete()

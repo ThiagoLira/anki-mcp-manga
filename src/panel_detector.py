@@ -369,12 +369,16 @@ def _annotate_page(image: Image.Image, panel_bboxes: list[list[float]]) -> Image
 # ---------------------------------------------------------------------------
 
 def _build_page_analysis(
-    image_np: np.ndarray, raw_panels: list[list[float]]
+    original: Image.Image, raw_panels: list[list[float]]
 ) -> PageAnalysis:
-    """Sort panels, crop, annotate — shared by both PyTorch and ONNX paths."""
+    """Sort panels, crop, annotate — shared by both PyTorch and ONNX paths.
+
+    Uses the original (full-colour) PIL image for cropping and annotation
+    so the LLM sees high-quality text, not a grayscale-degraded version.
+    """
     if not raw_panels:
         logger.warning("No panels detected, returning full page as single panel.")
-        h, w = image_np.shape[:2]
+        w, h = original.size
         raw_panels = [[0, 0, w, h]]
 
     if len(raw_panels) == 1:
@@ -385,15 +389,14 @@ def _build_page_analysis(
     sorted_bboxes = [raw_panels[i] for i in order]
 
     panels: list[Panel] = []
-    pil_image = Image.fromarray(image_np)
     for idx, bbox in enumerate(sorted_bboxes):
         x1, y1, x2, y2 = [int(round(v)) for v in bbox]
-        cropped = pil_image.crop((x1, y1, x2, y2)).convert("RGB")
+        cropped = original.crop((x1, y1, x2, y2)).convert("RGB")
         buf = io.BytesIO()
         cropped.save(buf, format="WebP", quality=85)
         panels.append(Panel(index=idx, bbox=bbox, image_bytes=buf.getvalue()))
 
-    annotated = _annotate_page(pil_image, sorted_bboxes)
+    annotated = _annotate_page(original, sorted_bboxes)
     ann_buf = io.BytesIO()
     annotated.save(ann_buf, format="WebP", quality=85)
 
@@ -427,18 +430,17 @@ class PanelDetector:
 
         self._load_model()
 
-        # Load image as numpy array (RGB)
-        image = Image.open(io.BytesIO(image_bytes)).convert("L").convert("RGB")
-        image_np = np.array(image)
+        original = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        # MagiV2 expects grayscale-ish input for detection
+        gray_np = np.array(original.convert("L").convert("RGB"))
 
-        # Run model
         with torch.no_grad():
-            results = self._model.predict_detections_and_associations([image_np])
+            results = self._model.predict_detections_and_associations([gray_np])
 
         page = results[0]
         raw_panels = _convert_to_list_of_lists(page["panels"])
 
-        return _build_page_analysis(image_np, raw_panels)
+        return _build_page_analysis(original, raw_panels)
 
 
 # ---------------------------------------------------------------------------
@@ -606,11 +608,11 @@ class OnnxPanelDetector:
         """Detect panels, sort in reading order, crop, and annotate."""
         self._load_model()
 
-        image = Image.open(io.BytesIO(image_bytes)).convert("L").convert("RGB")
-        image_np = np.array(image)
-        orig_h, orig_w = image_np.shape[:2]
+        original = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        gray_np = np.array(original.convert("L").convert("RGB"))
+        orig_h, orig_w = gray_np.shape[:2]
 
-        pixel_values, pixel_mask = _preprocess_image(image_np)
+        pixel_values, pixel_mask = _preprocess_image(gray_np)
         class_scores, boxes = self._session.run(
             None,
             {"pixel_values": pixel_values, "pixel_mask": pixel_mask},
@@ -618,4 +620,4 @@ class OnnxPanelDetector:
 
         raw_panels = _postprocess_detections(class_scores, boxes, orig_h, orig_w)
 
-        return _build_page_analysis(image_np, raw_panels)
+        return _build_page_analysis(original, raw_panels)
