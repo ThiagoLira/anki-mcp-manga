@@ -75,34 +75,56 @@ KANJI_AFMT = """\
 """
 
 # --- Manga Vocab notetype ---
-# Front: manga image + Japanese sentence (target word bolded)
-# Back: full sentence translation (target word bolded)
+# Two cards per note:
+#   Reading  — front: sentence (text), back: image + reading + audio + translation
+#   Listening — front: audio + word, back: sentence + image + translation
 
 MANGA_NOTETYPE = "Manga Vocab"
 MANGA_FIELDS = ["Word", "Sentence", "Image", "Translation", "Reading", "Audio"]
 
-MANGA_QFMT = """\
-{{#Image}}<div class="manga-image">{{Image}}</div>{{/Image}}
-<div class="sentence">{{Sentence}}</div>
-"""
-MANGA_AFMT = """\
+MANGA_TEMPLATES = [
+    {
+        "name": "Reading",
+        "qfmt": '<div class="sentence">{{Sentence}}</div>',
+        "afmt": """\
 {{FrontSide}}
 <hr id="answer">
+{{#Image}}<div class="manga-image">{{Image}}</div>{{/Image}}
 {{#Reading}}<div class="reading">{{Reading}}</div>{{/Reading}}
 <div class="translation">{{Translation}}</div>
+{{#Audio}}<div class="audio">{{Audio}}</div>{{/Audio}}""",
+    },
+    {
+        "name": "Listening",
+        "qfmt": """\
 {{#Audio}}<div class="audio">{{Audio}}</div>{{/Audio}}
-"""
+<div class="kanji">{{Word}}</div>""",
+        "afmt": """\
+{{FrontSide}}
+<hr id="answer">
+{{#Image}}<div class="manga-image">{{Image}}</div>{{/Image}}
+<div class="sentence">{{Sentence}}</div>
+<div class="translation">{{Translation}}</div>""",
+    },
+]
 
 
-def _ensure(col: Collection, name: str, fields: list[str], qfmt: str, afmt: str) -> dict:
-    """Get or create a notetype with a single card template.
+def _ensure(
+    col: Collection,
+    name: str,
+    fields: list[str],
+    templates: list[dict[str, str]],
+) -> dict:
+    """Get or create a notetype with one or more card templates.
 
-    If the notetype already exists, adds any missing fields and updates
-    the card template formats (migration for schema changes).
+    Each entry in *templates* is ``{"name": ..., "qfmt": ..., "afmt": ...}``.
+
+    If the notetype already exists, adds any missing fields and syncs
+    templates (add new ones, update changed formats).
     """
     existing = col.models.by_name(name)
     if existing:
-        # Add any missing fields (migration)
+        # Add any missing fields
         existing_names = {f["name"] for f in existing["flds"]}
         changed = False
         for field_name in fields:
@@ -110,12 +132,23 @@ def _ensure(col: Collection, name: str, fields: list[str], qfmt: str, afmt: str)
                 new_field = col.models.new_field(field_name)
                 col.models.add_field(existing, new_field)
                 changed = True
-        # Update template formats if they changed
-        tmpl = existing["tmpls"][0]
-        if tmpl["qfmt"] != qfmt or tmpl["afmt"] != afmt:
-            tmpl["qfmt"] = qfmt
-            tmpl["afmt"] = afmt
-            changed = True
+
+        # Sync templates: update existing, add missing
+        existing_tmpls = {t["name"]: t for t in existing["tmpls"]}
+        for tdef in templates:
+            if tdef["name"] in existing_tmpls:
+                tmpl = existing_tmpls[tdef["name"]]
+                if tmpl["qfmt"] != tdef["qfmt"] or tmpl["afmt"] != tdef["afmt"]:
+                    tmpl["qfmt"] = tdef["qfmt"]
+                    tmpl["afmt"] = tdef["afmt"]
+                    changed = True
+            else:
+                new_tmpl = col.models.new_template(tdef["name"])
+                new_tmpl["qfmt"] = tdef["qfmt"]
+                new_tmpl["afmt"] = tdef["afmt"]
+                col.models.add_template(existing, new_tmpl)
+                changed = True
+
         if changed:
             col.models.update_dict(existing)
         return existing
@@ -124,21 +157,24 @@ def _ensure(col: Collection, name: str, fields: list[str], qfmt: str, afmt: str)
     model["css"] = CSS
 
     for field_name in fields:
-        field = col.models.new_field(field_name)
-        col.models.add_field(model, field)
+        fld = col.models.new_field(field_name)
+        col.models.add_field(model, fld)
 
-    template = col.models.new_template("Card 1")
-    template["qfmt"] = qfmt
-    template["afmt"] = afmt
-    col.models.add_template(model, template)
+    for tdef in templates:
+        tmpl = col.models.new_template(tdef["name"])
+        tmpl["qfmt"] = tdef["qfmt"]
+        tmpl["afmt"] = tdef["afmt"]
+        col.models.add_template(model, tmpl)
 
     col.models.add(model)
     return model
 
 
 def ensure_kanji_notetype(col: Collection) -> dict:
-    return _ensure(col, KANJI_NOTETYPE, KANJI_FIELDS, KANJI_QFMT, KANJI_AFMT)
+    return _ensure(col, KANJI_NOTETYPE, KANJI_FIELDS, [
+        {"name": "Card 1", "qfmt": KANJI_QFMT, "afmt": KANJI_AFMT},
+    ])
 
 
 def ensure_manga_notetype(col: Collection) -> dict:
-    return _ensure(col, MANGA_NOTETYPE, MANGA_FIELDS, MANGA_QFMT, MANGA_AFMT)
+    return _ensure(col, MANGA_NOTETYPE, MANGA_FIELDS, MANGA_TEMPLATES)
