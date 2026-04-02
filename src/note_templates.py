@@ -133,8 +133,17 @@ def _ensure(
                 col.models.add_field(existing, new_field)
                 changed = True
 
-        # Sync templates: update existing, add missing
+        # Rename legacy templates before syncing (e.g. "Card 1" → "Reading")
         existing_tmpls = {t["name"]: t for t in existing["tmpls"]}
+        desired_names = {t["name"] for t in templates}
+        if len(templates) > 0 and len(existing["tmpls"]) == 1:
+            old_tmpl = existing["tmpls"][0]
+            if old_tmpl["name"] not in desired_names:
+                old_tmpl["name"] = templates[0]["name"]
+                existing_tmpls = {old_tmpl["name"]: old_tmpl}
+                changed = True
+
+        # Sync templates: update existing, add missing
         for tdef in templates:
             if tdef["name"] in existing_tmpls:
                 tmpl = existing_tmpls[tdef["name"]]
