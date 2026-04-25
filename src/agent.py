@@ -183,11 +183,21 @@ def _image_content(image_bytes: bytes, text: str) -> list[dict[str, Any]]:
 class CardAgent:
     """Orchestrates LLM calls for manga vocabulary extraction and card creation."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        model: str | None = None,
+        base_url: str | None = None,
+        api_key: str | None = None,
+        max_tokens: int | None = None,
+    ) -> None:
+        kwargs = {}
+        if max_tokens is not None:
+            kwargs["max_tokens"] = max_tokens
         self._llm = ChatOpenAI(
-            model=settings.openrouter_model,
-            base_url="https://openrouter.ai/api/v1",
-            api_key=settings.openrouter_api_key,
+            model=model or settings.openrouter_model,
+            base_url=base_url or "https://openrouter.ai/api/v1",
+            api_key=api_key or settings.openrouter_api_key,
+            **kwargs,
         )
 
     async def process_image(
