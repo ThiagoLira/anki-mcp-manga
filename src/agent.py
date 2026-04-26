@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
+import re
+import unicodedata
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -13,6 +16,7 @@ from .config import settings
 
 if TYPE_CHECKING:
     from .panel_detector import PageAnalysis
+    from .word_extractor import CandidateExtraction
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +92,18 @@ class TextResponse(BaseModel):
     )
 
 
+class TranslationItem(BaseModel):
+    """One translated sentence with the target word bolded."""
+    translation: str = Field(
+        description="Natural English translation of the sentence with the target word in <b>...</b>"
+    )
+
+
+class Translations(BaseModel):
+    """Batched translation response — same length and order as the input list."""
+    items: list[TranslationItem]
+
+
 # ---------------------------------------------------------------------------
 # Prompts
 # ---------------------------------------------------------------------------
@@ -149,10 +165,35 @@ If the user asks to create kanji/vocab cards, include them in kanji_cards.
 Otherwise, just respond helpfully about Japanese language topics.
 Respond in English."""
 
+TRANSLATION_PROMPT = """\
+Translate Japanese sentences from a manga page to English.
+
+## PAGE TRANSCRIPT (context — for resolving pronouns, subjects, tone)
+{transcript}
+
+## SENTENCES TO TRANSLATE
+{numbered_pairs}
+
+For each, return a natural English translation of the sentence, with the English equivalent of the marked word wrapped in <b>...</b>. Output JSON {{"items": [{{"translation": "..."}}, ...]}} — same length and order as the input list."""
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _probe_local_llm(url: str, timeout: float) -> bool:
+    """Quick HEAD/GET to {url}/models to see if a local OpenAI-compatible server
+    is alive. Any network/HTTP failure returns False (caller falls back)."""
+    import urllib.error
+    import urllib.request
+
+    probe_url = f"{url.rstrip('/')}/models"
+    try:
+        with urllib.request.urlopen(probe_url, timeout=timeout) as resp:
+            return 200 <= resp.status < 300
+    except (urllib.error.URLError, OSError, TimeoutError):
+        return False
+
 
 def _image_data_uri(image_bytes: bytes) -> str:
     """Build a base64 data URI with correct MIME type."""
@@ -193,12 +234,115 @@ class CardAgent:
         kwargs = {}
         if max_tokens is not None:
             kwargs["max_tokens"] = max_tokens
+
+        # If the caller didn't pin model/base_url/api_key, probe the local LLM
+        # (llama-server on janus over the tailnet) and prefer it when reachable.
+        # Falls back to OpenRouter on probe failure.
+        if model is None and base_url is None and api_key is None:
+            if _probe_local_llm(settings.local_llm_url, settings.local_llm_probe_timeout_s):
+                model = settings.local_llm_model
+                base_url = settings.local_llm_url
+                api_key = "local"
+                logger.info("Using local LLM at %s", base_url)
+            else:
+                logger.info(
+                    "Local LLM at %s unreachable; using OpenRouter",
+                    settings.local_llm_url,
+                )
+
         self._llm = ChatOpenAI(
             model=model or settings.openrouter_model,
             base_url=base_url or "https://openrouter.ai/api/v1",
             api_key=api_key or settings.openrouter_api_key,
             **kwargs,
         )
+        self._word_extractor = None  # lazy
+
+    # ------------------------------------------------------------------
+    # Two-phase pipeline (used by the bot's word-selection flow)
+    # ------------------------------------------------------------------
+
+    async def extract_candidates(self, image_bytes: bytes) -> "CandidateExtraction":
+        """Run the deterministic word-extraction pipeline. No LLM calls.
+
+        Heavy CPU work (panel detection, bubble detection, manga-ocr,
+        tokenization) is offloaded to a worker thread so the event loop
+        stays responsive.
+        """
+        if self._word_extractor is None:
+            from .word_extractor import WordExtractor
+            self._word_extractor = WordExtractor()
+        logger.info("extract_candidates: image=%d bytes", len(image_bytes))
+        return await asyncio.to_thread(self._word_extractor.extract, image_bytes)
+
+    async def generate_cards(
+        self,
+        extraction: "CandidateExtraction",
+        selected_indices: list[int],
+    ) -> list[PendingCard]:
+        """Translate the selected candidates (one batched LLM call) and build PendingCards."""
+        selected = [extraction.candidates[i] for i in selected_indices]
+        if not selected:
+            return []
+
+        transcript = self._format_transcript(extraction.ocr_per_panel)
+        pairs = "\n".join(
+            f"{i + 1}. word=「{c.word}」 (form in sentence: 「{c.surface}」), "
+            f"sentence=「{c.sentence}」"
+            for i, c in enumerate(selected)
+        )
+        prompt = TRANSLATION_PROMPT.format(transcript=transcript, numbered_pairs=pairs)
+
+        logger.info(
+            "generate_cards: translating %d selected candidates in one batched call",
+            len(selected),
+        )
+        llm = self._llm.with_structured_output(Translations)
+        result = await llm.ainvoke([HumanMessage(content=prompt)])
+
+        items = result.items
+        if len(items) != len(selected):
+            logger.warning(
+                "Translation count mismatch: got %d, expected %d — padding/truncating",
+                len(items), len(selected),
+            )
+            items = (list(items) + [TranslationItem(translation="")] * len(selected))[:len(selected)]
+
+        cards: list[PendingCard] = []
+        for cand, item in zip(selected, items):
+            sentence_bolded = self._bold(cand.sentence, cand.surface)
+            sent_clean = re.sub(r"</?b>", "", sentence_bolded)
+            if (unicodedata.normalize("NFKC", cand.surface)
+                    not in unicodedata.normalize("NFKC", sent_clean)):
+                logger.warning("Dropping %s: surface %s not in sentence", cand.word, cand.surface)
+                continue
+            translation = (item.translation or "").strip()
+            if not translation or not any(c.isascii() and c.isalpha() for c in translation):
+                logger.warning("Dropping %s: empty/non-English translation", cand.word)
+                continue
+            cards.append(PendingCard(
+                card_type="manga",
+                word=cand.word,
+                reading=cand.reading,
+                sentence=sentence_bolded,
+                translation=translation,
+                image_data=cand.panel_image,
+            ))
+        logger.info("generate_cards: produced %d cards (dropped %d)",
+                    len(cards), len(selected) - len(cards))
+        return cards
+
+    @staticmethod
+    def _format_transcript(ocr_per_panel: list[list[str]]) -> str:
+        parts = []
+        for i, lines in enumerate(ocr_per_panel):
+            joined = " / ".join(lines) if lines else "(no text)"
+            parts.append(f"Panel {i + 1}: {joined}")
+        return "\n".join(parts)
+
+    @staticmethod
+    def _bold(sentence: str, surface: str) -> str:
+        return re.sub(re.escape(surface), f"<b>{surface}</b>", sentence, count=1)
 
     async def process_image(
         self,

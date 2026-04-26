@@ -19,6 +19,7 @@ from .agent import CardAgent, PendingCard
 from .anki_manager import AnkiManager
 from .config import settings
 from .sync_manager import SyncManager
+from .word_extractor import CandidateExtraction
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +87,29 @@ class ReviewSession:
 pending_reviews: dict[str, ReviewSession] = {}
 
 
+@dataclass
+class WordSelectionSession:
+    """Tracks a candidate word list awaiting user selection (before translation)."""
+    extraction: CandidateExtraction
+    selected: list[bool] = field(default_factory=list)
+    panel_msg_ids: dict[int, int] = field(default_factory=dict)  # panel_idx -> message_id
+    control_msg_id: int = 0
+    chat_id: int = 0
+    caption: str = ""
+    created_at: float = field(default_factory=time.time)
+
+    def __post_init__(self) -> None:
+        if not self.selected:
+            self.selected = [False] * len(self.extraction.candidates)
+
+    @property
+    def n_selected(self) -> int:
+        return sum(self.selected)
+
+
+pending_word_selections: dict[str, WordSelectionSession] = {}
+
+
 def _new_session_id() -> str:
     return secrets.token_hex(4)  # 8 hex chars
 
@@ -95,6 +119,12 @@ def _purge_stale_sessions() -> None:
     stale = [sid for sid, s in pending_reviews.items() if now - s.created_at > SESSION_TTL]
     for sid in stale:
         del pending_reviews[sid]
+    stale_ws = [
+        sid for sid, s in pending_word_selections.items()
+        if now - s.created_at > SESSION_TTL
+    ]
+    for sid in stale_ws:
+        del pending_word_selections[sid]
 
 
 def _card_caption(card: PendingCard) -> str:
@@ -128,6 +158,72 @@ def _bulk_keyboard(session_id: str) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="✅ Done — create accepted, skip rest", callback_data=f"mc:{session_id}:all:done"),
         ],
     ])
+
+
+# ---------------------------------------------------------------------------
+# Word-selection UI (step 1 of 2: pick which words to translate)
+# ---------------------------------------------------------------------------
+
+def _word_panel_keyboard(
+    session_id: str, session: WordSelectionSession, panel_index: int,
+) -> InlineKeyboardMarkup:
+    """Toggle button per candidate that lives in the given panel."""
+    rows = []
+    for i, cand in enumerate(session.extraction.candidates):
+        if cand.panel_index != panel_index:
+            continue
+        check = "☑" if session.selected[i] else "☐"
+        rows.append([InlineKeyboardButton(
+            text=f"{check} {cand.word} ({cand.reading})",
+            callback_data=f"ws:{session_id}:t:{i}",
+        )])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _word_control_keyboard(session_id: str, n_selected: int) -> InlineKeyboardMarkup:
+    label = f"✨ Generate {n_selected} cards" if n_selected > 0 else "✨ Generate (none selected)"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="☑ Select all", callback_data=f"ws:{session_id}:all:s"),
+            InlineKeyboardButton(text="☐ Clear all", callback_data=f"ws:{session_id}:all:c"),
+        ],
+        [InlineKeyboardButton(text=label, callback_data=f"ws:{session_id}:go:-")],
+    ])
+
+
+async def _send_word_picker(
+    chat_id: int, session_id: str, session: WordSelectionSession,
+) -> None:
+    """One message per panel (image + word toggles), then a control message."""
+    panel_indices = sorted({c.panel_index for c in session.extraction.candidates})
+    for panel_idx in panel_indices:
+        panel_cands = [c for c in session.extraction.candidates if c.panel_index == panel_idx]
+        panel_image = panel_cands[0].panel_image
+        ocr_lines = (
+            session.extraction.ocr_per_panel[panel_idx]
+            if panel_idx < len(session.extraction.ocr_per_panel) else []
+        )
+        ocr_text = "\n".join(f"<i>{line}</i>" for line in ocr_lines) if ocr_lines else "<i>(no text)</i>"
+        caption = f"<b>Panel {panel_idx + 1}</b>\n{ocr_text}"
+        if len(caption) > 1000:
+            caption = caption[:997] + "..."
+        kb = _word_panel_keyboard(session_id, session, panel_idx)
+        photo = BufferedInputFile(panel_image, filename=f"panel_{panel_idx}.jpg")
+        msg = await bot.send_photo(
+            chat_id, photo=photo, caption=caption,
+            parse_mode="HTML", reply_markup=kb,
+        )
+        session.panel_msg_ids[panel_idx] = msg.message_id
+
+    n = len(session.extraction.candidates)
+    control = await bot.send_message(
+        chat_id,
+        f"<b>{n}</b> candidate words across <b>{len(panel_indices)}</b> panels. "
+        "Pick the ones to learn, then hit Generate.",
+        parse_mode="HTML",
+        reply_markup=_word_control_keyboard(session_id, 0),
+    )
+    session.control_msg_id = control.message_id
 
 
 async def _send_card_previews(
@@ -282,59 +378,36 @@ async def handle_photo(message: Message) -> None:
     if not _is_allowed(message.from_user.id, message.from_user.username):
         return
 
-    # Download the largest resolution photo
     photo = message.photo[-1]
     file = await bot.get_file(photo.file_id)
     bio = await bot.download_file(file.file_path)
     image_bytes = bio.read()
+    caption = message.caption or ""
 
-    caption = message.caption or "Extract vocabulary from this manga page and create cards."
-
-    # Panel detection (optional, runs before the agent)
-    page_analysis = None
-    if settings.enable_panel_detection:
-        processing = await message.answer("Detecting panels...")
-        try:
-            detector = _get_panel_detector()
-            page_analysis = detector.detect(image_bytes)
-            logger.info("Detected %d panels", len(page_analysis.panels))
-        except Exception as e:
-            logger.warning("Panel detection failed, falling back to full page: %s", e)
-            page_analysis = None
+    processing = await message.answer("Detecting panels and extracting words...")
+    try:
+        async with agent_lock:
+            extraction = await agent.extract_candidates(image_bytes)
+    except Exception as e:
+        logger.exception("Word extraction failed")
         await processing.delete()
-
-    n_panels = len(page_analysis.panels) if page_analysis else 0
-    if page_analysis and n_panels >= 5:
-        processing = await message.answer(
-            f"Processing {n_panels} panels (summarising page, then extracting per panel)..."
-        )
-    else:
-        processing = await message.answer("Processing image...")
-
-    async with agent_lock:
-        try:
-            result = await agent.process_image(caption, image_bytes, page_analysis)
-        except Exception as e:
-            logger.exception("Agent error")
-            await processing.delete()
-            await message.answer(f"Error: {e}")
-            return
+        await message.answer(f"Extraction failed: {e}")
+        return
     await processing.delete()
 
-    # Send agent text response
-    if result.text:
-        await message.answer(result.text)
+    if not extraction.candidates:
+        await message.answer("No interesting vocabulary found on this page.")
+        return
 
-    # If there are proposed cards, start a review session
-    if result.pending_cards:
-        _purge_stale_sessions()
-        session_id = _new_session_id()
-        session = ReviewSession(
-            cards=result.pending_cards,
-            chat_id=message.chat.id,
-        )
-        pending_reviews[session_id] = session
-        await _send_card_previews(message.chat.id, session_id, session)
+    _purge_stale_sessions()
+    session_id = _new_session_id()
+    session = WordSelectionSession(
+        extraction=extraction,
+        chat_id=message.chat.id,
+        caption=caption,
+    )
+    pending_word_selections[session_id] = session
+    await _send_word_picker(message.chat.id, session_id, session)
 
 
 @dp.message(F.text)
@@ -508,6 +581,116 @@ async def handle_card_review(callback: CallbackQuery) -> None:
             except Exception:
                 pass
         await _finalize_session(session_id, session)
+
+
+@dp.callback_query(F.data.startswith("ws:"))
+async def handle_word_selection(callback: CallbackQuery) -> None:
+    """Toggle/bulk/go buttons on the word-selection picker."""
+    parts = callback.data.split(":")
+    if len(parts) < 3:
+        await callback.answer("Invalid callback data.")
+        return
+
+    session_id = parts[1]
+    action = parts[2]
+    session = pending_word_selections.get(session_id)
+    if session is None:
+        await callback.answer("Session expired.", show_alert=True)
+        return
+
+    if action == "t":
+        if len(parts) != 4:
+            await callback.answer("Invalid callback data.")
+            return
+        idx = int(parts[3])
+        if idx < 0 or idx >= len(session.extraction.candidates):
+            await callback.answer("Invalid index.")
+            return
+        session.selected[idx] = not session.selected[idx]
+        panel_idx = session.extraction.candidates[idx].panel_index
+        msg_id = session.panel_msg_ids.get(panel_idx)
+        if msg_id is not None:
+            try:
+                await bot.edit_message_reply_markup(
+                    chat_id=session.chat_id, message_id=msg_id,
+                    reply_markup=_word_panel_keyboard(session_id, session, panel_idx),
+                )
+            except Exception:
+                pass
+        try:
+            await bot.edit_message_reply_markup(
+                chat_id=session.chat_id, message_id=session.control_msg_id,
+                reply_markup=_word_control_keyboard(session_id, session.n_selected),
+            )
+        except Exception:
+            pass
+        await callback.answer()
+        return
+
+    if action == "all":
+        if len(parts) != 4:
+            await callback.answer("Invalid callback data.")
+            return
+        new_state = parts[3] == "s"
+        session.selected = [new_state] * len(session.selected)
+        for panel_idx, msg_id in session.panel_msg_ids.items():
+            try:
+                await bot.edit_message_reply_markup(
+                    chat_id=session.chat_id, message_id=msg_id,
+                    reply_markup=_word_panel_keyboard(session_id, session, panel_idx),
+                )
+            except Exception:
+                pass
+        try:
+            await bot.edit_message_reply_markup(
+                chat_id=session.chat_id, message_id=session.control_msg_id,
+                reply_markup=_word_control_keyboard(session_id, session.n_selected),
+            )
+        except Exception:
+            pass
+        await callback.answer("Selected all." if new_state else "Cleared all.")
+        return
+
+    if action == "go":
+        if session.n_selected == 0:
+            await callback.answer("Pick at least one word first.", show_alert=True)
+            return
+
+        n = session.n_selected
+        try:
+            await bot.edit_message_text(
+                chat_id=session.chat_id, message_id=session.control_msg_id,
+                text=f"Generating cards for {n} selected word{'s' if n != 1 else ''}...",
+            )
+        except Exception:
+            pass
+        await callback.answer()
+
+        selected_indices = [i for i, s in enumerate(session.selected) if s]
+        try:
+            async with agent_lock:
+                cards = await agent.generate_cards(session.extraction, selected_indices)
+        except Exception as e:
+            logger.exception("Card generation failed")
+            await bot.send_message(session.chat_id, f"Card generation failed: {e}")
+            return
+
+        del pending_word_selections[session_id]
+
+        if not cards:
+            await bot.send_message(
+                session.chat_id,
+                "All selected candidates failed validation. No cards to review.",
+            )
+            return
+
+        review_session_id = _new_session_id()
+        review_session = ReviewSession(cards=cards, chat_id=session.chat_id)
+        pending_reviews[review_session_id] = review_session
+        await _send_card_previews(session.chat_id, review_session_id, review_session)
+        return
+
+    await callback.answer("Unknown action.")
 
 
 async def main() -> None:

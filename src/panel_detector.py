@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import io
 import logging
+import os
 from copy import deepcopy
 from dataclasses import dataclass
 from itertools import groupby
@@ -15,6 +16,10 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 logger = logging.getLogger(__name__)
+
+# llama.cpp's mtmd image loader does not accept WebP; allow override.
+_PANEL_IMAGE_FORMAT = os.environ.get("PANEL_IMAGE_FORMAT", "webp").lower()
+_PANEL_IMAGE_QUALITY = int(os.environ.get("PANEL_IMAGE_QUALITY", "85"))
 
 
 # ---------------------------------------------------------------------------
@@ -393,12 +398,12 @@ def _build_page_analysis(
         x1, y1, x2, y2 = [int(round(v)) for v in bbox]
         cropped = original.crop((x1, y1, x2, y2)).convert("RGB")
         buf = io.BytesIO()
-        cropped.save(buf, format="WebP", quality=85)
+        cropped.save(buf, format=_PANEL_IMAGE_FORMAT.upper(), quality=_PANEL_IMAGE_QUALITY)
         panels.append(Panel(index=idx, bbox=bbox, image_bytes=buf.getvalue()))
 
     annotated = _annotate_page(original, sorted_bboxes)
     ann_buf = io.BytesIO()
-    annotated.save(ann_buf, format="WebP", quality=85)
+    annotated.save(ann_buf, format=_PANEL_IMAGE_FORMAT.upper(), quality=_PANEL_IMAGE_QUALITY)
 
     return PageAnalysis(panels=panels, annotated_image=ann_buf.getvalue())
 

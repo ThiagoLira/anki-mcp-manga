@@ -8,6 +8,13 @@ class Settings(BaseSettings):
     openrouter_api_key: str
     openrouter_model: str = "anthropic/claude-sonnet-4"
 
+    # Local LLM (e.g. llama-server on the janus tailnet host) — probed at agent
+    # init; if reachable, used in preference to OpenRouter. Override per-host
+    # via the LOCAL_LLM_URL env var (e.g. http://janus:8080/v1 or http://127.0.0.1:8080/v1).
+    local_llm_url: str = "http://100.81.144.115:8080/v1"
+    local_llm_model: str = "local"
+    local_llm_probe_timeout_s: float = 1.0
+
     sync_user: str = "user"
     sync_password: str = "password"
     sync_endpoint: str = "http://anki-sync:8080"

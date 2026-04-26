@@ -23,7 +23,7 @@ sys.path.insert(0, str(ROOT))
 
 from src import agent as agent_module
 from src.agent import CardAgent
-from src.panel_detector import PanelDetector
+from src.panel_detector import OnnxPanelDetector, PanelDetector
 
 load_dotenv()
 
@@ -56,10 +56,12 @@ async def run_one(agent: CardAgent, detector: PanelDetector, img_path: Path, out
             for c in result.pending_cards
         ]
         summary_text = result.text
+        result_text = result.text
     except Exception as e:
         error = f"{type(e).__name__}: {e}"
         cards = []
         summary_text = ""
+        result_text = ""
     agent_s = time.time() - t_agent
 
     record = {
@@ -78,7 +80,7 @@ async def run_one(agent: CardAgent, detector: PanelDetector, img_path: Path, out
     (img_dir / "result.json").write_text(
         json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8"
     )
-    (img_dir / "summary.txt").write_text(result.text, encoding="utf-8")
+    (img_dir / "summary.txt").write_text(result_text, encoding="utf-8")
     status = "FAIL" if error else "OK  "
     suffix = f"  error={error[:60]}" if error else ""
     print(
@@ -111,7 +113,10 @@ async def main_async(args: argparse.Namespace) -> None:
     if args.force_per_panel:
         agent_module.MULTI_PANEL_THRESHOLD = 1  # always take per-panel path
 
-    detector = PanelDetector(device=args.panel_device)
+    if args.detector == "onnx":
+        detector = OnnxPanelDetector(model_path=args.panel_model_path)
+    else:
+        detector = PanelDetector(device=args.panel_device)
     agent = CardAgent(
         model=args.model, base_url=args.base_url, api_key=api_key, max_tokens=args.max_tokens
     )
@@ -148,8 +153,16 @@ def main() -> None:
     )
     parser.add_argument("--images-dir", type=Path, default=IMAGE_DIR)
     parser.add_argument(
+        "--detector", default="onnx", choices=["onnx", "pytorch"],
+        help="Panel detector backend (default: onnx)"
+    )
+    parser.add_argument(
         "--panel-device", default="cpu", choices=["cpu", "cuda"],
-        help="Device for panel detector"
+        help="Device for PyTorch panel detector (ignored for onnx)"
+    )
+    parser.add_argument(
+        "--panel-model-path", default="models/panel_detector.onnx",
+        help="Path to ONNX panel detector"
     )
     parser.add_argument(
         "--force-per-panel", action="store_true",

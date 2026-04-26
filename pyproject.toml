@@ -10,6 +10,14 @@ dependencies = [
     "Pillow>=10.0",
     "anki",
     "pydantic-settings>=2.0",
+    "python-dotenv>=1.2.1",
+    "onnxruntime>=1.25.0",
+    "fugashi[unidic-lite]>=1.5.2",
+    "wordfreq>=3.1.1",
+    "jaconv>=0.5.0",
+    "manga-ocr>=0.1.14",
+    "mecab-python3>=1.0.12",
+    "ipadic>=1.0.0",
 ]
 
 [project.optional-dependencies]
