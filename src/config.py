@@ -15,6 +15,12 @@ class Settings(BaseSettings):
     local_llm_model: str = "local"
     local_llm_probe_timeout_s: float = 1.0
 
+    # Irodori-TTS HTTP server (VoiceDesign-only, runs on janus over Tailscale).
+    # Primary TTS path; falls back to in-process Kokoro on any timeout / connect /
+    # HTTP error. Set to empty string to disable Irodori entirely (Kokoro-only).
+    irodori_tts_url: str = "http://100.81.144.115:8200"
+    irodori_tts_timeout_s: float = 90.0
+
     sync_user: str = "user"
     sync_password: str = "password"
     sync_endpoint: str = "http://anki-sync:8080"

@@ -269,13 +269,17 @@ def _create_card(card: PendingCard) -> None:
             meaning=card.meaning, tags=card.tags,
         )
     else:
-        # Generate TTS audio from the Japanese sentence
+        # Generate TTS audio. Prefer the LLM-styled (emoji-decorated) Japanese
+        # text, falling back to the plain sentence if styling is empty.
         audio_data = None
-        if card.sentence:
+        tts_input = card.tts_text.strip() or _strip_html(card.sentence)
+        if tts_input:
             try:
                 from .tts import generate_tts
-                plain_sentence = _strip_html(card.sentence)
-                audio_data = generate_tts(plain_sentence)
+                audio_data = generate_tts(
+                    tts_input,
+                    caption=card.voice_description_jp.strip() or None,
+                )
             except Exception as e:
                 logger.warning("TTS generation failed for '%s': %s", card.word, e)
         manager.create_manga_card(

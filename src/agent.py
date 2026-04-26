@@ -41,6 +41,9 @@ class PendingCard:
     kanji: str = ""
     reading: str = ""
     meaning: str = ""
+    # TTS styling (populated for manga cards by the styled-translation pass)
+    tts_text: str = ""               # Japanese sentence with inline style emojis
+    voice_description_jp: str = ""   # JP caption for VoiceDesign-mode TTS
 
 
 @dataclass
@@ -92,16 +95,28 @@ class TextResponse(BaseModel):
     )
 
 
-class TranslationItem(BaseModel):
-    """One translated sentence with the target word bolded."""
+class StyledTranslationItem(BaseModel):
+    """Translation + TTS styling for a single sentence."""
     translation: str = Field(
-        description="Natural English translation of the sentence with the target word in <b>...</b>"
+        description="Natural English translation of the sentence with the target word in <b>...</b>."
+    )
+    tts_text: str = Field(
+        description=(
+            "The original Japanese sentence (no HTML tags) with style emojis "
+            "added inline. Used as TTS input."
+        )
+    )
+    voice_description_jp: str = Field(
+        description=(
+            "Short Japanese caption describing the speaker's voice "
+            "(gender/age/tone). Used as the VoiceDesign caption."
+        )
     )
 
 
-class Translations(BaseModel):
-    """Batched translation response — same length and order as the input list."""
-    items: list[TranslationItem]
+class StyledTranslations(BaseModel):
+    """Batched styled-translation response — same length and order as input."""
+    items: list[StyledTranslationItem]
 
 
 # ---------------------------------------------------------------------------
@@ -166,15 +181,50 @@ Otherwise, just respond helpfully about Japanese language topics.
 Respond in English."""
 
 TRANSLATION_PROMPT = """\
-Translate Japanese sentences from a manga page to English.
+Process Japanese sentences from a manga page. For each sentence return three \
+fields: an English translation, an emoji-styled Japanese version for TTS, and \
+a Japanese voice description for the speaker.
 
-## PAGE TRANSCRIPT (context — for resolving pronouns, subjects, tone)
+## PAGE TRANSCRIPT (context — speakers, tone, narrative)
 {transcript}
 
-## SENTENCES TO TRANSLATE
+## SENTENCES TO PROCESS
 {numbered_pairs}
 
-For each, return a natural English translation of the sentence, with the English equivalent of the marked word wrapped in <b>...</b>. Output JSON {{"items": [{{"translation": "..."}}, ...]}} — same length and order as the input list."""
+For each numbered sentence, return:
+
+1. translation
+   Natural English translation. Wrap the English equivalent of the marked \
+word in <b>...</b>.
+
+2. tts_text
+   The original Japanese sentence (no HTML tags) with style emojis added \
+inline to convey emotion and prosody. Place emojis adjacent to the words/\
+phrases they modify. Most lines need 0–2 emojis; repeat an emoji to intensify.
+   ONLY use emojis from this set:
+   - Emotion: 😠 angry, 😏 teasing, 🥺 timid, 🫶 gentle, 😱 scream, 😖 in pain, \
+😟 worried, 🫣 shy, 🙄 exasperated, 😊 cheerful, 🙏 pleading, 🥴 drunk, \
+😰 panicked/stuttering, 😌 relieved, 🤔 questioning, 😲 surprise, 😆 joyful, \
+🤭 chuckle, 😭 sobbing
+   - Breath/voice: 😮‍💨 sigh, 🌬️ heavy breath, 😮 gasp, 😪 sleepy, 🥱 yawn, \
+🥵 panting, 👂 whisper, 📢 loud/echo, 👅 wet sound, 💋 lip smack, 🥤 swallow, \
+🤧 sniffle, 😒 tongue click, 🤐 muffled
+   - Prosody: ⏩ fast, 🐢 slow, ⏸️ pause, 📞 phone/speaker
+   - Sound: 👌 backchannel, 🎵 humming
+   Do NOT invent new emojis or use any not in this list.
+
+3. voice_description_jp
+   A short Japanese caption describing the speaker's voice (gender, age, \
+tone). Use the page transcript to infer who the speaker is. End with \
+「読み上げてください。」 or 「語ってください。」. Keep under 80 characters.
+   Examples:
+   - 「30代の落ち着いた成人男性の声で、自信に満ちた穏やかな口調で読み上げてください。」
+   - 「年配の威厳ある男性の声で、深く重く力強くゆっくりと語ってください。」
+   - 「元気な少年の高めの声で、無邪気で好奇心を込めて読み上げてください。」
+   - 「神秘的な大人の女性の声で、低めに落ち着いた口調で読み上げてください。」
+
+Output JSON {{"items": [{{"translation": "...", "tts_text": "...", \
+"voice_description_jp": "..."}}, ...]}} — same length and order as the input."""
 
 
 # ---------------------------------------------------------------------------
@@ -294,19 +344,22 @@ class CardAgent:
         prompt = TRANSLATION_PROMPT.format(transcript=transcript, numbered_pairs=pairs)
 
         logger.info(
-            "generate_cards: translating %d selected candidates in one batched call",
+            "generate_cards: translating+styling %d candidates in one batched call",
             len(selected),
         )
-        llm = self._llm.with_structured_output(Translations)
+        llm = self._llm.with_structured_output(StyledTranslations)
         result = await llm.ainvoke([HumanMessage(content=prompt)])
 
         items = result.items
         if len(items) != len(selected):
             logger.warning(
-                "Translation count mismatch: got %d, expected %d — padding/truncating",
+                "Item count mismatch: got %d, expected %d — padding/truncating",
                 len(items), len(selected),
             )
-            items = (list(items) + [TranslationItem(translation="")] * len(selected))[:len(selected)]
+            empty = StyledTranslationItem(
+                translation="", tts_text="", voice_description_jp="",
+            )
+            items = (list(items) + [empty] * len(selected))[:len(selected)]
 
         cards: list[PendingCard] = []
         for cand, item in zip(selected, items):
@@ -320,6 +373,8 @@ class CardAgent:
             if not translation or not any(c.isascii() and c.isalpha() for c in translation):
                 logger.warning("Dropping %s: empty/non-English translation", cand.word)
                 continue
+            tts_text = (item.tts_text or "").strip() or sent_clean
+            voice_description = (item.voice_description_jp or "").strip()
             cards.append(PendingCard(
                 card_type="manga",
                 word=cand.word,
@@ -327,6 +382,8 @@ class CardAgent:
                 sentence=sentence_bolded,
                 translation=translation,
                 image_data=cand.panel_image,
+                tts_text=tts_text,
+                voice_description_jp=voice_description,
             ))
         logger.info("generate_cards: produced %d cards (dropped %d)",
                     len(cards), len(selected) - len(cards))

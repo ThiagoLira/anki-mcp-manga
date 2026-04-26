@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import logging
+import urllib.error
+import urllib.request
 
-import soundfile as sf
+from .config import settings
 
 logger = logging.getLogger(__name__)
 
-# Model files — downloaded during Docker build to models/tts/
-_MODEL_PATH = "models/tts/kokoro-v1.0.int8.onnx"
-_VOICES_PATH = "models/tts/voices-v1.0.bin"
+# Kokoro fallback model files — downloaded during Docker build to models/tts/
+_KOKORO_MODEL_PATH = "models/tts/kokoro-v1.0.int8.onnx"
+_KOKORO_VOICES_PATH = "models/tts/voices-v1.0.bin"
+_KOKORO_VOICE = "jf_alpha"
 
 _kokoro = None
 _g2p = None
@@ -21,7 +25,7 @@ def _get_kokoro():
     if _kokoro is None:
         from kokoro_onnx import Kokoro
         logger.info("Loading Kokoro TTS model...")
-        _kokoro = Kokoro(_MODEL_PATH, _VOICES_PATH)
+        _kokoro = Kokoro(_KOKORO_MODEL_PATH, _KOKORO_VOICES_PATH)
         logger.info("Kokoro TTS model loaded.")
     return _kokoro
 
@@ -36,24 +40,56 @@ def _get_g2p():
     return _g2p
 
 
-def generate_tts(text: str, voice: str = "jf_alpha", speed: float = 1.0) -> bytes:
-    """Generate WAV audio bytes from Japanese text using Kokoro TTS.
-
-    Returns WAV file bytes ready to be stored in Anki media.
-    """
+def _generate_kokoro(text: str) -> bytes:
+    """Synthesize WAV bytes via in-process Kokoro ONNX (single fixed voice)."""
+    import soundfile as sf
     kokoro = _get_kokoro()
     g2p = _get_g2p()
-
-    # Use misaki's Japanese G2P for proper phonemization
-    # (Kokoro's built-in phonemizer falls back to espeak which mangles Japanese)
     phonemes, _ = g2p(text)
     samples, sample_rate = kokoro.create(
-        phonemes, voice=voice, speed=speed, lang="ja", is_phonemes=True,
+        phonemes, voice=_KOKORO_VOICE, speed=1.0, lang="ja", is_phonemes=True,
     )
-
     buf = io.BytesIO()
     sf.write(buf, samples, sample_rate, format="WAV")
     return buf.getvalue()
+
+
+def _generate_irodori(text: str, caption: str | None) -> bytes:
+    """POST to the Irodori VoiceDesign HTTP server, return WAV bytes."""
+    payload: dict[str, object] = {"text": text}
+    if caption:
+        payload["caption"] = caption
+    body = json.dumps(payload).encode("utf-8")
+    url = settings.irodori_tts_url.rstrip("/") + "/tts"
+    req = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=settings.irodori_tts_timeout_s) as resp:
+        if resp.status != 200:
+            raise RuntimeError(f"irodori HTTP {resp.status}")
+        return resp.read()
+
+
+def generate_tts(text: str, *, caption: str | None = None) -> bytes:
+    """Synthesize Japanese TTS as WAV bytes ready for Anki media.
+
+    Primary path: Irodori-TTS (VoiceDesign) over HTTP, with the speaker caption
+    in `caption`. Falls back to in-process Kokoro on any timeout / connection /
+    HTTP error so card creation never blocks on the remote server.
+    """
+    irodori_url = (settings.irodori_tts_url or "").strip()
+    if irodori_url:
+        try:
+            return _generate_irodori(text, caption)
+        except (urllib.error.URLError, OSError, TimeoutError, RuntimeError) as exc:
+            logger.warning(
+                "Irodori TTS at %s failed (%s); falling back to Kokoro",
+                irodori_url, exc,
+            )
+    return _generate_kokoro(text)
 
 
 def tts_filename(wav_bytes: bytes) -> str:
