@@ -15,7 +15,7 @@ venv/
 data/
 models/
 benchmark_results/
-tts_tests/
+outputs/
 
 .pytest_cache/
 .mypy_cache/

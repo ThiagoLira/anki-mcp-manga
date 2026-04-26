@@ -69,6 +69,26 @@ The sync server is only reachable via Tailscale:
 
 `CardAgent.__init__` probes `local_llm_url` (default `http://janus:8080/v1` over Tailscale, see `src/config.py`) at startup and uses it if reachable; otherwise falls back to OpenRouter (`OPENROUTER_API_KEY`). The local backend on `janus` is a `llama-server` instance — bind it to `0.0.0.0` (not `127.0.0.1`) for the tailnet probe to reach it.
 
+The styled-translation pass is a **single batched LLM call** in `CardAgent.generate_cards` (see `agent.py::TRANSLATION_PROMPT` and `StyledTranslationItem`). It produces, per selected candidate: an English `translation`, an emoji-decorated Japanese `tts_text`, and a Japanese `voice_description_jp` caption. The emoji palette in the prompt is a fixed subset of the Irodori-TTS-documented set; do not extend it without re-checking what the model recognizes.
+
+### TTS backend
+
+Two paths, with automatic fallback inside `src/tts.py::generate_tts`:
+
+1. **Primary — Irodori-TTS HTTP server** (caption-driven, VoiceDesign-only). Lives in the sibling repo at `~/repos/irodori-tts-server` (FastAPI, vendored upstream model code, runs on `janus` over Tailscale). The bot calls `POST http://100.81.144.115:8200/tts` with `{text: tts_text, caption: voice_description_jp}`. URL is overridable via `IRODORI_TTS_URL`; set to empty string to disable Irodori entirely.
+
+2. **Fallback — Kokoro-ONNX in-process.** The existing single-voice (`jf_alpha`) Kokoro path, baked into the bot image. Triggered automatically on any `URLError` / timeout / non-200 from the Irodori server. No emoji/caption support — just plain text.
+
+The bot Docker image still installs the `[tts]` extras for the Kokoro fallback. The Irodori server itself is deployed separately from `~/repos/irodori-tts-server` (its own Dockerfile) and is not part of `bash k8s/deploy.sh`.
+
+E2E sanity test (requires the Irodori server reachable):
+
+```bash
+.venv/bin/python scripts/test_irodori_e2e.py test_manga_images/manga2.jpg 3
+```
+
+Writes WAVs + `summary.json` to `outputs/e2e/` (gitignored).
+
 ### Panel detection model
 
 The ONNX model (`models/panel_detector.onnx` + `.data`, ~166MB) is gitignored. After cloning to a new deploy host, either:

@@ -6,10 +6,13 @@
 4. CardAgent.generate_cards: ONE batched LLM call producing
    translation + tts_text + voice_description_jp per card.
 5. tts.generate_tts on each card: hits Irodori HTTP (Kokoro fallback on error).
-6. Writes wavs + summary.json to tts_tests/outputs/e2e/.
+6. Writes wavs + summary.json to outputs/e2e/.
 
 Run from repo root:
     .venv/bin/python scripts/test_irodori_e2e.py [image-path] [N]
+
+Requires the irodori-tts-server (sibling repo ~/repos/irodori-tts-server)
+to be reachable at $IRODORI_TTS_URL (default http://janus:8200).
 """
 from __future__ import annotations
 
@@ -33,7 +36,7 @@ async def main() -> None:
     )
     n_select = int(sys.argv[2]) if len(sys.argv) > 2 else 3
 
-    out_dir = ROOT / "tts_tests" / "outputs" / "e2e"
+    out_dir = ROOT / "outputs" / "e2e"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"[1] loading {image_path}")
