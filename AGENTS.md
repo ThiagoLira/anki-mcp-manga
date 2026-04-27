@@ -67,7 +67,7 @@ The sync server is only reachable via Tailscale:
 
 ### LLM backend
 
-`CardAgent.__init__` probes `local_llm_url` (default `http://janus:8080/v1` over Tailscale, see `src/config.py`) at startup and uses it if reachable; otherwise falls back to OpenRouter (`OPENROUTER_API_KEY`). The local backend on `janus` is a `llama-server` instance — bind it to `0.0.0.0` (not `127.0.0.1`) for the tailnet probe to reach it.
+`CardAgent.__init__` probes `local_llm_url` (default `http://100.81.144.115:9080/v1` — janus tailscale IP, port 9080 — see `src/config.py`) at startup and uses it if reachable; otherwise falls back to OpenRouter (`OPENROUTER_API_KEY`). The local backend on `janus` is now a `llama-server` pod in the same k3s cluster (the `models` namespace, runs on the `janus` node — see the sibling `homelab` repo's `k8s/llama-server.yaml`). Port 9080, not 8080, because port 8080 on every node IP is claimed cluster-wide by the anki-sync-external LoadBalancer Service.
 
 The styled-translation pass is a **single batched LLM call** in `CardAgent.generate_cards` (see `agent.py::TRANSLATION_PROMPT` and `StyledTranslationItem`). It produces, per selected candidate: an English `translation`, an emoji-decorated Japanese `tts_text`, and a Japanese `voice_description_jp` caption. The emoji palette in the prompt is a fixed subset of the Irodori-TTS-documented set; do not extend it without re-checking what the model recognizes.
 

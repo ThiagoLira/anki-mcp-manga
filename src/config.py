@@ -8,10 +8,13 @@ class Settings(BaseSettings):
     openrouter_api_key: str
     openrouter_model: str = "anthropic/claude-sonnet-4"
 
-    # Local LLM (e.g. llama-server on the janus tailnet host) — probed at agent
-    # init; if reachable, used in preference to OpenRouter. Override per-host
-    # via the LOCAL_LLM_URL env var (e.g. http://janus:8080/v1 or http://127.0.0.1:8080/v1).
-    local_llm_url: str = "http://100.81.144.115:8080/v1"
+    # Local LLM (llama-server pod on the janus k3s agent node, reached over
+    # Tailscale). Probed at agent init; if reachable, used in preference to
+    # OpenRouter. The pod exposes containerPort 8080 via hostPort 9080 — port
+    # 8080 on every node IP is claimed cluster-wide by the anki-sync-external
+    # LoadBalancer Service, so we picked 9080 for llama. Override per-host via
+    # LOCAL_LLM_URL env var.
+    local_llm_url: str = "http://100.81.144.115:9080/v1"
     local_llm_model: str = "local"
     local_llm_probe_timeout_s: float = 1.0
 
