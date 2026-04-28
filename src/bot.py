@@ -110,6 +110,18 @@ class WordSelectionSession:
 pending_word_selections: dict[str, WordSelectionSession] = {}
 
 
+@dataclass
+class ModeSession:
+    """Holds an uploaded image while the user picks a workflow (flashcards / read page)."""
+    image_bytes: bytes
+    caption: str
+    chat_id: int
+    created_at: float = field(default_factory=time.time)
+
+
+pending_modes: dict[str, ModeSession] = {}
+
+
 def _new_session_id() -> str:
     return secrets.token_hex(4)  # 8 hex chars
 
@@ -125,6 +137,12 @@ def _purge_stale_sessions() -> None:
     ]
     for sid in stale_ws:
         del pending_word_selections[sid]
+    stale_modes = [
+        sid for sid, s in pending_modes.items()
+        if now - s.created_at > SESSION_TTL
+    ]
+    for sid in stale_modes:
+        del pending_modes[sid]
 
 
 def _card_caption(card: PendingCard) -> str:
@@ -158,6 +176,17 @@ def _bulk_keyboard(session_id: str) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="✅ Done — create accepted, skip rest", callback_data=f"mc:{session_id}:all:done"),
         ],
     ])
+
+
+# ---------------------------------------------------------------------------
+# Mode picker (shown right after photo upload)
+# ---------------------------------------------------------------------------
+
+def _mode_picker_keyboard(session_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="📚 Create flashcards", callback_data=f"mode:{session_id}:fc"),
+        InlineKeyboardButton(text="🔊 Read page", callback_data=f"mode:{session_id}:rp"),
+    ]])
 
 
 # ---------------------------------------------------------------------------
@@ -388,30 +417,134 @@ async def handle_photo(message: Message) -> None:
     image_bytes = bio.read()
     caption = message.caption or ""
 
-    processing = await message.answer("Detecting panels and extracting words...")
+    _purge_stale_sessions()
+    session_id = _new_session_id()
+    pending_modes[session_id] = ModeSession(
+        image_bytes=image_bytes,
+        caption=caption,
+        chat_id=message.chat.id,
+    )
+    await message.answer(
+        "What would you like to do with this image?",
+        reply_markup=_mode_picker_keyboard(session_id),
+    )
+
+
+async def _run_flashcard_flow(chat_id: int, image_bytes: bytes, caption: str) -> None:
+    """Existing pipeline: detect panels + OCR, then show the word-picker UI."""
+    processing = await bot.send_message(chat_id, "Detecting panels and extracting words...")
     try:
         async with agent_lock:
             extraction = await agent.extract_candidates(image_bytes)
     except Exception as e:
         logger.exception("Word extraction failed")
         await processing.delete()
-        await message.answer(f"Extraction failed: {e}")
+        await bot.send_message(chat_id, f"Extraction failed: {e}")
         return
     await processing.delete()
 
     if not extraction.candidates:
-        await message.answer("No interesting vocabulary found on this page.")
+        await bot.send_message(chat_id, "No interesting vocabulary found on this page.")
         return
 
-    _purge_stale_sessions()
     session_id = _new_session_id()
     session = WordSelectionSession(
         extraction=extraction,
-        chat_id=message.chat.id,
+        chat_id=chat_id,
         caption=caption,
     )
     pending_word_selections[session_id] = session
-    await _send_word_picker(message.chat.id, session_id, session)
+    await _send_word_picker(chat_id, session_id, session)
+
+
+async def _run_read_page_flow(chat_id: int, image_bytes: bytes, caption: str) -> None:
+    """Read Page pipeline: detect panels + OCR, style each panel, send image + TTS audio."""
+    processing = await bot.send_message(chat_id, "Detecting panels and OCRing dialogue...")
+    try:
+        async with agent_lock:
+            extraction = await agent.extract_candidates(image_bytes)
+    except Exception as e:
+        logger.exception("Read page extraction failed")
+        await processing.delete()
+        await bot.send_message(chat_id, f"Extraction failed: {e}")
+        return
+
+    if not extraction.panel_images:
+        await processing.delete()
+        await bot.send_message(chat_id, "No panels detected on this page.")
+        return
+
+    try:
+        await processing.edit_text(
+            f"Styling {len(extraction.panel_images)} panels for reading..."
+        )
+    except Exception:
+        pass
+
+    try:
+        async with agent_lock:
+            styled = await agent.style_panels_for_reading(extraction)
+    except Exception as e:
+        logger.exception("Read page styling failed")
+        await processing.delete()
+        await bot.send_message(chat_id, f"Styling failed: {e}")
+        return
+
+    await processing.delete()
+
+    n_panels = len(extraction.panel_images)
+
+    async def _tts_for_panel(i: int) -> bytes | None:
+        item = styled[i] if i < len(styled) else None
+        ocr_lines = (
+            extraction.ocr_per_panel[i]
+            if i < len(extraction.ocr_per_panel) else []
+        )
+        tts_input = (item.tts_text.strip() if item else "") or " ".join(ocr_lines).strip()
+        if not tts_input:
+            return None
+        try:
+            from .tts import generate_tts
+            return await asyncio.to_thread(
+                generate_tts,
+                tts_input,
+                caption=(item.voice_description_jp.strip() if item else None) or None,
+            )
+        except Exception as e:
+            logger.warning("TTS generation failed for panel %d: %s", i + 1, e)
+            return None
+
+    # Fan out all TTS jobs in parallel; we await each one in panel order below
+    # so audio messages stay aligned with their photos.
+    tts_tasks = [asyncio.create_task(_tts_for_panel(i)) for i in range(n_panels)]
+
+    for i, panel_image in enumerate(extraction.panel_images):
+        ocr_lines = (
+            extraction.ocr_per_panel[i]
+            if i < len(extraction.ocr_per_panel) else []
+        )
+        ocr_text = (
+            "\n".join(f"<i>{line}</i>" for line in ocr_lines)
+            if ocr_lines else "<i>(no dialogue)</i>"
+        )
+        panel_caption = f"<b>Panel {i + 1}/{n_panels}</b>\n{ocr_text}"
+        if len(panel_caption) > 1000:
+            panel_caption = panel_caption[:997] + "..."
+        photo = BufferedInputFile(panel_image, filename=f"panel_{i}.webp")
+        await bot.send_photo(chat_id, photo=photo, caption=panel_caption, parse_mode="HTML")
+
+        audio_bytes = await tts_tasks[i]
+        if audio_bytes is None:
+            continue
+        audio_file = BufferedInputFile(audio_bytes, filename=f"panel_{i}.wav")
+        await bot.send_audio(
+            chat_id,
+            audio=audio_file,
+            title=f"Panel {i + 1}",
+            performer="Read Page",
+        )
+
+    await bot.send_message(chat_id, f"Read Page complete: {n_panels} panels.")
 
 
 @dp.message(F.text)
@@ -446,6 +579,50 @@ async def handle_text(message: Message) -> None:
         )
         pending_reviews[session_id] = session
         await _send_card_previews(message.chat.id, session_id, session)
+
+
+@dp.callback_query(F.data.startswith("mode:"))
+async def handle_mode_pick(callback: CallbackQuery) -> None:
+    """User chose flashcards vs. read-page right after uploading an image."""
+    parts = callback.data.split(":")
+    if len(parts) != 3:
+        await callback.answer("Invalid callback data.")
+        return
+
+    _, session_id, choice = parts
+    mode_session = pending_modes.pop(session_id, None)
+    if mode_session is None:
+        await callback.answer("Session expired.", show_alert=True)
+        return
+
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    if choice == "fc":
+        try:
+            await callback.message.edit_text("📚 Creating flashcards...")
+        except Exception:
+            pass
+        await callback.answer()
+        await _run_flashcard_flow(
+            mode_session.chat_id, mode_session.image_bytes, mode_session.caption,
+        )
+        return
+
+    if choice == "rp":
+        try:
+            await callback.message.edit_text("🔊 Reading page...")
+        except Exception:
+            pass
+        await callback.answer()
+        await _run_read_page_flow(
+            mode_session.chat_id, mode_session.image_bytes, mode_session.caption,
+        )
+        return
+
+    await callback.answer("Unknown choice.")
 
 
 @dp.callback_query(F.data.startswith("mc:"))

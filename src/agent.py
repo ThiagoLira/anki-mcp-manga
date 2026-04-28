@@ -119,6 +119,29 @@ class StyledTranslations(BaseModel):
     items: list[StyledTranslationItem]
 
 
+class StyledPanelItem(BaseModel):
+    """TTS styling for a full panel (one combined utterance, one voice)."""
+    tts_text: str = Field(
+        description=(
+            "The panel's dialogue/narration concatenated into a single Japanese "
+            "block (no HTML tags) with style emojis added inline. Used as TTS "
+            "input. Empty string if the panel has no dialogue."
+        )
+    )
+    voice_description_jp: str = Field(
+        description=(
+            "Short Japanese caption describing the panel speaker's voice "
+            "(gender/age/tone). Used as the VoiceDesign caption. Empty string "
+            "if the panel has no dialogue."
+        )
+    )
+
+
+class StyledPanels(BaseModel):
+    """Batched styled-panel response — same length and order as input."""
+    items: list[StyledPanelItem]
+
+
 # ---------------------------------------------------------------------------
 # Prompts
 # ---------------------------------------------------------------------------
@@ -225,6 +248,52 @@ tone). Use the page transcript to infer who the speaker is. End with \
 
 Output JSON {{"items": [{{"translation": "...", "tts_text": "...", \
 "voice_description_jp": "..."}}, ...]}} — same length and order as the input."""
+
+READ_PAGE_PROMPT = """\
+Process Japanese dialogue from a manga page panel-by-panel for a TTS reading \
+exercise. For each panel return styled TTS text and a voice description.
+
+## PAGE TRANSCRIPT (context — speakers, tone, narrative)
+{transcript}
+
+For each numbered panel below, return:
+
+1. tts_text
+   The panel's dialogue concatenated into a single Japanese utterance (no HTML \
+tags). If the panel has multiple bubbles, join them with full-width spaces \
+「　」 or punctuation that fits the flow. Add style emojis inline to convey \
+emotion and prosody. Place emojis adjacent to the words/phrases they modify. \
+Most panels need 0–3 emojis; repeat an emoji to intensify.
+   ONLY use emojis from this set:
+   - Emotion: 😠 angry, 😏 teasing, 🥺 timid, 🫶 gentle, 😱 scream, 😖 in pain, \
+😟 worried, 🫣 shy, 🙄 exasperated, 😊 cheerful, 🙏 pleading, 🥴 drunk, \
+😰 panicked/stuttering, 😌 relieved, 🤔 questioning, 😲 surprise, 😆 joyful, \
+🤭 chuckle, 😭 sobbing
+   - Breath/voice: 😮‍💨 sigh, 🌬️ heavy breath, 😮 gasp, 😪 sleepy, 🥱 yawn, \
+🥵 panting, 👂 whisper, 📢 loud/echo, 👅 wet sound, 💋 lip smack, 🥤 swallow, \
+🤧 sniffle, 😒 tongue click, 🤐 muffled
+   - Prosody: ⏩ fast, 🐢 slow, ⏸️ pause, 📞 phone/speaker
+   - Sound: 👌 backchannel, 🎵 humming
+   Do NOT invent new emojis or use any not in this list.
+   If the panel has no dialogue, return an empty string.
+
+2. voice_description_jp
+   A short Japanese caption describing the panel speaker's voice (gender, \
+age, tone). Use the page transcript to infer who is speaking. End with \
+「読み上げてください。」 or 「語ってください。」. Keep under 80 characters. \
+If the panel has multiple speakers, pick the dominant one. \
+If the panel has no dialogue, return an empty string.
+   Examples:
+   - 「30代の落ち着いた成人男性の声で、自信に満ちた穏やかな口調で読み上げてください。」
+   - 「年配の威厳ある男性の声で、深く重く力強くゆっくりと語ってください。」
+   - 「元気な少年の高めの声で、無邪気で好奇心を込めて読み上げてください。」
+   - 「神秘的な大人の女性の声で、低めに落ち着いた口調で読み上げてください。」
+
+## PANELS
+{numbered_panels}
+
+Output JSON {{"items": [{{"tts_text": "...", "voice_description_jp": "..."}}, \
+...]}} — same length and order as the input panels."""
 
 
 # ---------------------------------------------------------------------------
@@ -388,6 +457,43 @@ class CardAgent:
         logger.info("generate_cards: produced %d cards (dropped %d)",
                     len(cards), len(selected) - len(cards))
         return cards
+
+    async def style_panels_for_reading(
+        self,
+        extraction: "CandidateExtraction",
+    ) -> list[StyledPanelItem]:
+        """Batched LLM call: style each panel's dialogue for TTS reading.
+
+        Returns one StyledPanelItem per panel in `extraction.ocr_per_panel`,
+        in the same order. Panels with no dialogue get empty fields.
+        """
+        n_panels = len(extraction.ocr_per_panel)
+        if n_panels == 0:
+            return []
+
+        transcript = self._format_transcript(extraction.ocr_per_panel)
+        numbered = []
+        for i, lines in enumerate(extraction.ocr_per_panel):
+            joined = " / ".join(lines) if lines else "(no dialogue)"
+            numbered.append(f"{i + 1}. {joined}")
+        prompt = READ_PAGE_PROMPT.format(
+            transcript=transcript,
+            numbered_panels="\n".join(numbered),
+        )
+
+        logger.info("style_panels_for_reading: styling %d panels in one batched call", n_panels)
+        llm = self._llm.with_structured_output(StyledPanels)
+        result = await llm.ainvoke([HumanMessage(content=prompt)])
+
+        items = list(result.items)
+        if len(items) != n_panels:
+            logger.warning(
+                "Panel count mismatch: got %d, expected %d — padding/truncating",
+                len(items), n_panels,
+            )
+            empty = StyledPanelItem(tts_text="", voice_description_jp="")
+            items = (items + [empty] * n_panels)[:n_panels]
+        return items
 
     @staticmethod
     def _format_transcript(ocr_per_panel: list[list[str]]) -> str:

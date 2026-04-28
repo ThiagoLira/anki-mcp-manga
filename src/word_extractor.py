@@ -51,6 +51,7 @@ class WordCandidate:
 class CandidateExtraction:
     candidates: list[WordCandidate]
     ocr_per_panel: list[list[str]]  # full transcript, used for translation context
+    panel_images: list[bytes] = field(default_factory=list)  # WebP bytes, aligned with ocr_per_panel
 
 
 # ---------------------------------------------------------------------------
@@ -195,6 +196,7 @@ class WordExtractor:
 
         # OCR each bubble, in panel reading order
         ocr_per_panel: list[list[str]] = []
+        panel_images: list[bytes] = []
         sentence_panels: list[tuple[int, bytes, str]] = []  # (panel_idx, panel_image, sentence)
         for panel in page.panels:
             lines = []
@@ -205,13 +207,18 @@ class WordExtractor:
                 lines.append(line)
                 sentence_panels.append((panel.index, panel.image_bytes, line))
             ocr_per_panel.append(lines)
+            panel_images.append(panel.image_bytes)
 
         candidates = self._tokenize_and_filter(sentence_panels)
         logger.info(
             "WordExtractor: %d panels, %d bubbles, %d candidate words",
             len(page.panels), len(ordered), len(candidates),
         )
-        return CandidateExtraction(candidates=candidates, ocr_per_panel=ocr_per_panel)
+        return CandidateExtraction(
+            candidates=candidates,
+            ocr_per_panel=ocr_per_panel,
+            panel_images=panel_images,
+        )
 
     def _tokenize_and_filter(self, sentence_panels) -> list[WordCandidate]:
         seen_lemmas: set[str] = set()
