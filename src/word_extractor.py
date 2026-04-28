@@ -26,7 +26,7 @@ from .panel_detector import (
 logger = logging.getLogger(__name__)
 
 _TEXT_CLASS_IDX = 1
-_SCORE_THRESHOLD = 0.2
+_SCORE_THRESHOLD = 0.1
 _NMS_IOU_THRESHOLD = 0.5
 
 _HIRA_LO, _HIRA_HI = "ぁ", "ゟ"
@@ -114,8 +114,15 @@ def _detect_text_bubbles(detector: OnnxPanelDetector, image_bytes: bytes):
         class_scores, boxes, orig_h, orig_w, _TEXT_CLASS_IDX, _SCORE_THRESHOLD
     )
     if not bboxes:
+        logger.info("_detect_text_bubbles: 0 bubbles above threshold %.2f", _SCORE_THRESHOLD)
         return original, []
     keep = _nms(bboxes, scores, _NMS_IOU_THRESHOLD)
+    kept_scores = sorted((float(scores[i]) for i in keep), reverse=True)
+    logger.info(
+        "_detect_text_bubbles: %d above threshold %.2f, %d after NMS, scores=[%s]",
+        len(bboxes), _SCORE_THRESHOLD, len(keep),
+        ", ".join(f"{s:.2f}" for s in kept_scores),
+    )
     return original, [bboxes[i] for i in keep]
 
 
@@ -193,6 +200,10 @@ class WordExtractor:
         for bbox, p_idx in ordered:
             if 0 <= p_idx < len(page.panels):
                 bubbles_by_panel[p_idx].append(bbox)
+        logger.info(
+            "bubbles per panel: %s",
+            {idx: len(bubs) for idx, bubs in bubbles_by_panel.items()},
+        )
 
         # OCR each bubble, in panel reading order
         ocr_per_panel: list[list[str]] = []
