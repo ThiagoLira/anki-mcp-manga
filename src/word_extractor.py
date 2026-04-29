@@ -26,8 +26,15 @@ from .panel_detector import (
 logger = logging.getLogger(__name__)
 
 _TEXT_CLASS_IDX = 1
-_SCORE_THRESHOLD = 0.1
+# MagiV2 author's default for text is 0.3; we sit slightly below it for recall.
+# Going lower (0.1) flooded manga-ocr with false positives — and manga-ocr is
+# documented to hallucinate Japanese on any image, even empty ones, so each
+# false-positive bubble produced garbage text and duplicate fragments.
+_SCORE_THRESHOLD = 0.2
 _NMS_IOU_THRESHOLD = 0.5
+# Drop bubble detections smaller than this fraction of the page area —
+# tiny boxes are almost always spurious and manga-ocr will hallucinate on them.
+_MIN_BUBBLE_AREA_FRAC = 0.003
 
 _HIRA_LO, _HIRA_HI = "ぁ", "ゟ"
 _KATA_LO, _KATA_HI = "ァ", "ヿ"
@@ -116,11 +123,26 @@ def _detect_text_bubbles(detector: OnnxPanelDetector, image_bytes: bytes):
     if not bboxes:
         logger.info("_detect_text_bubbles: 0 bubbles above threshold %.2f", _SCORE_THRESHOLD)
         return original, []
+    page_area = float(orig_h) * float(orig_w)
+    min_area = page_area * _MIN_BUBBLE_AREA_FRAC
+    area_keep = [
+        i for i, b in enumerate(bboxes)
+        if (b[2] - b[0]) * (b[3] - b[1]) >= min_area
+    ]
+    dropped_tiny = len(bboxes) - len(area_keep)
+    bboxes = [bboxes[i] for i in area_keep]
+    scores = scores[area_keep] if len(scores) else scores
+    if not bboxes:
+        logger.info(
+            "_detect_text_bubbles: %d bubbles dropped as too small (<%.1f%% of page)",
+            dropped_tiny, _MIN_BUBBLE_AREA_FRAC * 100,
+        )
+        return original, []
     keep = _nms(bboxes, scores, _NMS_IOU_THRESHOLD)
     kept_scores = sorted((float(scores[i]) for i in keep), reverse=True)
     logger.info(
-        "_detect_text_bubbles: %d above threshold %.2f, %d after NMS, scores=[%s]",
-        len(bboxes), _SCORE_THRESHOLD, len(keep),
+        "_detect_text_bubbles: %d above threshold %.2f, %d dropped tiny, %d after NMS, scores=[%s]",
+        len(bboxes) + dropped_tiny, _SCORE_THRESHOLD, dropped_tiny, len(keep),
         ", ".join(f"{s:.2f}" for s in kept_scores),
     )
     return original, [bboxes[i] for i in keep]
@@ -136,6 +158,34 @@ def _is_pure_katakana(s: str) -> bool:
 
 def _has_japanese_chars(s: str) -> bool:
     return any("　" <= c <= "鿿" or "＀" <= c <= "￯" for c in s)
+
+
+def _dedup_substring_lines(lines: list[str]) -> list[str]:
+    """Drop OCR lines that are substrings of another line in the same panel.
+
+    manga-ocr hallucinates on bad crops and the model can also produce
+    multiple partial reads of the same bubble when our detector emits
+    overlapping boxes. Both cases show up as one line being a prefix or
+    substring of another — keep the longest, drop the fragments.
+    """
+    cleaned = [s.strip() for s in lines if s and s.strip()]
+    if len(cleaned) <= 1:
+        return cleaned
+    # Sort longest-first so we keep maximal lines and drop their fragments
+    ordered = sorted(cleaned, key=len, reverse=True)
+    kept: list[str] = []
+    for line in ordered:
+        if any(line in k for k in kept):
+            continue
+        kept.append(line)
+    # Preserve original (reading) order
+    seen: set[str] = set()
+    out: list[str] = []
+    for line in cleaned:
+        if line in kept and line not in seen:
+            out.append(line)
+            seen.add(line)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -210,12 +260,18 @@ class WordExtractor:
         panel_images: list[bytes] = []
         sentence_panels: list[tuple[int, bytes, str]] = []  # (panel_idx, panel_image, sentence)
         for panel in page.panels:
-            lines = []
+            raw_lines: list[str] = []
             for bbox in bubbles_by_panel[panel.index]:
                 x1, y1, x2, y2 = [int(round(v)) for v in bbox]
                 bubble = original.crop((x1, y1, x2, y2)).convert("RGB")
-                line = self._mocr(bubble)
-                lines.append(line)
+                raw_lines.append(self._mocr(bubble))
+            lines = _dedup_substring_lines(raw_lines)
+            if len(raw_lines) != len(lines):
+                logger.info(
+                    "panel %d: %d OCR lines → %d after substring dedup",
+                    panel.index, len(raw_lines), len(lines),
+                )
+            for line in lines:
                 sentence_panels.append((panel.index, panel.image_bytes, line))
             ocr_per_panel.append(lines)
             panel_images.append(panel.image_bytes)
