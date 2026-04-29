@@ -19,10 +19,21 @@ class Settings(BaseSettings):
     local_llm_probe_timeout_s: float = 1.0
 
     # Irodori-TTS HTTP server (VoiceDesign-only, runs on janus over Tailscale).
-    # Primary TTS path; falls back to in-process Kokoro on any timeout / connect /
-    # HTTP error. Set to empty string to disable Irodori entirely (Kokoro-only).
+    # Primary TTS path; falls back to the Kokoro-FastAPI service on any timeout /
+    # connect / HTTP error. Set to empty string to disable Irodori entirely
+    # (Kokoro-only).
     irodori_tts_url: str = "http://100.81.144.115:8200"
     irodori_tts_timeout_s: float = 90.0
+
+    # Kokoro-FastAPI service (CPU pod on teagolab-1, k8s LoadBalancer at 8880).
+    # Fallback path when Irodori is unreachable. Replaces the previous
+    # in-process kokoro-onnx + misaki[ja] dependency, dropping ~325 MB of
+    # baked-in model weights and the espeak-ng/cmake build deps. Voice prefix
+    # `jf_` = Japanese female; pick another voice (e.g. `jm_kumo`) by setting
+    # KOKORO_TTS_VOICE.
+    kokoro_tts_url: str = "http://100.102.150.83:8880"
+    kokoro_tts_timeout_s: float = 30.0
+    kokoro_tts_voice: str = "jf_alpha"
 
     sync_user: str = "user"
     sync_password: str = "password"
