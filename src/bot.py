@@ -20,7 +20,7 @@ from .agent import CardAgent, PendingCard
 from .anki_manager import AnkiManager
 from .config import settings
 from .sync_manager import SyncManager
-from .word_extractor import CandidateExtraction
+from .word_extractor import CandidateExtraction, WordCandidate
 
 logger = logging.getLogger(__name__)
 
@@ -554,8 +554,9 @@ async def _run_read_page_flow(chat_id: int, image_bytes: bytes, caption: str) ->
 
 
 async def _run_explain_page_flow(chat_id: int, image_bytes: bytes, caption: str) -> None:
-    """Explain Page pipeline: detect panels + OCR, then a single LLM call to
-    produce a plain-English summary, vocabulary list, and notable expressions."""
+    """Explain Page pipeline: detect panels + OCR, ask the LLM for a summary
+    + vocab + expressions, then surface vocab/expressions through the
+    existing word-picker UI so the user can build flashcards from them."""
     processing = await bot.send_message(chat_id, "Detecting panels and OCRing dialogue...")
     try:
         async with agent_lock:
@@ -586,69 +587,101 @@ async def _run_explain_page_flow(chat_id: int, image_bytes: bytes, caption: str)
         return
 
     await processing.delete()
-    await _send_explanation(chat_id, explanation)
+    await _send_summary(chat_id, explanation.summary)
+
+    synthetic = _explanation_to_extraction(explanation, extraction)
+    if not synthetic.candidates:
+        await bot.send_message(chat_id, "No flashcard-worthy vocabulary on this page.")
+        return
+
+    _purge_stale_sessions()
+    session_id = _new_session_id()
+    session = WordSelectionSession(
+        extraction=synthetic, chat_id=chat_id, caption=caption,
+    )
+    pending_word_selections[session_id] = session
+    await _send_word_picker(chat_id, session_id, session)
 
 
-# Telegram caps text messages at 4096 chars; leave headroom for the wrapper +
-# any trailing ellipsis when we split a long list across messages.
-_TELEGRAM_TEXT_BUDGET = 3800
+async def _send_summary(chat_id: int, summary: str) -> None:
+    summary = (summary or "").strip()
+    if not summary:
+        return
+    await bot.send_message(
+        chat_id,
+        f"<b>📖 Summary</b>\n{html.escape(summary)}",
+        parse_mode="HTML",
+    )
 
 
-async def _send_explanation(chat_id: int, explanation) -> None:
-    """Render a PageExplanation as up to three Telegram messages: summary,
-    vocabulary, expressions. Splits a section across messages if it would
-    exceed Telegram's 4096-char text limit."""
-    summary = (explanation.summary or "").strip()
-    if summary:
-        await bot.send_message(
-            chat_id,
-            f"<b>📖 Summary</b>\n{html.escape(summary)}",
-            parse_mode="HTML",
+# Kanji range for the okurigana-stripping fallback in _match_panel_for_surface.
+_KANJI_RE = "一-鿿"
+
+
+def _match_panel_for_surface(
+    surface: str, ocr_per_panel: list[list[str]]
+) -> tuple[int, str]:
+    """Find the best (panel_index, sentence) for a surface form.
+
+    1. Exact substring match on any OCR line.
+    2. If the surface has kanji, retry on its kanji-only prefix (handles cases
+       where the LLM returned the bare stem and the page has ~okurigana~).
+    3. Fallback: panel 0 with sentence == surface so the validator in
+       agent.generate_cards (`surface in sentence`) trivially passes.
+    """
+    for p_idx, lines in enumerate(ocr_per_panel):
+        for line in lines:
+            if surface and surface in line:
+                return p_idx, line
+    import re
+    kanji_only = "".join(re.findall(f"[{_KANJI_RE}]+", surface))
+    if kanji_only and kanji_only != surface:
+        for p_idx, lines in enumerate(ocr_per_panel):
+            for line in lines:
+                if kanji_only in line:
+                    return p_idx, line
+    return 0, surface
+
+
+def _explanation_to_extraction(
+    explanation, extraction: CandidateExtraction,
+) -> CandidateExtraction:
+    """Adapt PageExplanation.{vocabulary, expressions} into a synthetic
+    CandidateExtraction so they flow through the existing word-picker /
+    flashcard pipeline. Reuses the original page's OCR + panel images."""
+    pairs: list[tuple[str, str]] = []  # (surface, reading)
+    for v in explanation.vocabulary or []:
+        pairs.append((v.word.strip(), v.reading.strip()))
+    for e in explanation.expressions or []:
+        pairs.append((e.expression.strip(), e.reading.strip()))
+
+    seen: set[str] = set()
+    candidates: list[WordCandidate] = []
+    for surface, reading in pairs:
+        if not surface or surface in seen:
+            continue
+        seen.add(surface)
+        panel_idx, sentence = _match_panel_for_surface(surface, extraction.ocr_per_panel)
+        if panel_idx >= len(extraction.panel_images):
+            panel_idx = 0
+        panel_image = (
+            extraction.panel_images[panel_idx]
+            if extraction.panel_images else b""
         )
+        candidates.append(WordCandidate(
+            word=surface,
+            surface=surface,
+            reading=reading,
+            sentence=sentence,
+            panel_index=panel_idx,
+            panel_image=panel_image,
+        ))
 
-    if explanation.vocabulary:
-        vocab_lines = []
-        for v in explanation.vocabulary:
-            word = html.escape(v.word.strip())
-            reading = html.escape(v.reading.strip())
-            translation = html.escape(v.translation.strip())
-            note = html.escape((v.note or "").strip())
-            line = f"• <b>{word}</b>【{reading}】 — {translation}"
-            if note:
-                line += f" <i>({note})</i>"
-            vocab_lines.append(line)
-        await _send_long_list(chat_id, "<b>📚 Vocabulary</b>", vocab_lines)
-
-    if explanation.expressions:
-        expr_lines = []
-        for e in explanation.expressions:
-            expression = html.escape(e.expression.strip())
-            reading = html.escape(e.reading.strip())
-            explanation_text = html.escape(e.explanation.strip())
-            expr_lines.append(
-                f"• <b>{expression}</b>【{reading}】 — {explanation_text}"
-            )
-        await _send_long_list(chat_id, "<b>💬 Expressions</b>", expr_lines)
-
-
-async def _send_long_list(chat_id: int, header: str, lines: list[str]) -> None:
-    """Send `header` followed by `lines`, splitting into multiple messages if
-    the joined length exceeds Telegram's per-message text budget."""
-    chunks: list[list[str]] = [[]]
-    current_len = len(header) + 1  # +1 for the newline after the header
-    for line in lines:
-        # +1 for the newline separator between lines
-        if current_len + len(line) + 1 > _TELEGRAM_TEXT_BUDGET and chunks[-1]:
-            chunks.append([])
-            current_len = 0
-        chunks[-1].append(line)
-        current_len += len(line) + 1
-    for i, chunk in enumerate(chunks):
-        prefix = header if i == 0 else f"{header} <i>(cont.)</i>"
-        body = "\n".join(chunk)
-        await bot.send_message(
-            chat_id, f"{prefix}\n{body}", parse_mode="HTML",
-        )
+    return CandidateExtraction(
+        candidates=candidates,
+        ocr_per_panel=extraction.ocr_per_panel,
+        panel_images=extraction.panel_images,
+    )
 
 
 @dp.message(F.text)
