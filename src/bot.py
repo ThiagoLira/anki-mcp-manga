@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 import secrets
 import time
@@ -183,10 +184,15 @@ def _bulk_keyboard(session_id: str) -> InlineKeyboardMarkup:
 # ---------------------------------------------------------------------------
 
 def _mode_picker_keyboard(session_id: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="📚 Create flashcards", callback_data=f"mode:{session_id}:fc"),
-        InlineKeyboardButton(text="🔊 Read page", callback_data=f"mode:{session_id}:rp"),
-    ]])
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="📚 Create flashcards", callback_data=f"mode:{session_id}:fc"),
+            InlineKeyboardButton(text="🔊 Read page", callback_data=f"mode:{session_id}:rp"),
+        ],
+        [
+            InlineKeyboardButton(text="🧠 Explain page", callback_data=f"mode:{session_id}:ep"),
+        ],
+    ])
 
 
 # ---------------------------------------------------------------------------
@@ -547,6 +553,104 @@ async def _run_read_page_flow(chat_id: int, image_bytes: bytes, caption: str) ->
     await bot.send_message(chat_id, f"Read Page complete: {n_panels} panels.")
 
 
+async def _run_explain_page_flow(chat_id: int, image_bytes: bytes, caption: str) -> None:
+    """Explain Page pipeline: detect panels + OCR, then a single LLM call to
+    produce a plain-English summary, vocabulary list, and notable expressions."""
+    processing = await bot.send_message(chat_id, "Detecting panels and OCRing dialogue...")
+    try:
+        async with agent_lock:
+            extraction = await agent.extract_candidates(image_bytes)
+    except Exception as e:
+        logger.exception("Explain page extraction failed")
+        await processing.delete()
+        await bot.send_message(chat_id, f"Extraction failed: {e}")
+        return
+
+    if not any(extraction.ocr_per_panel):
+        await processing.delete()
+        await bot.send_message(chat_id, "No text detected on this page.")
+        return
+
+    try:
+        await processing.edit_text("Asking the LLM to explain the page...")
+    except Exception:
+        pass
+
+    try:
+        async with agent_lock:
+            explanation = await agent.explain_page(extraction)
+    except Exception as e:
+        logger.exception("Explain page LLM call failed")
+        await processing.delete()
+        await bot.send_message(chat_id, f"Explanation failed: {e}")
+        return
+
+    await processing.delete()
+    await _send_explanation(chat_id, explanation)
+
+
+# Telegram caps text messages at 4096 chars; leave headroom for the wrapper +
+# any trailing ellipsis when we split a long list across messages.
+_TELEGRAM_TEXT_BUDGET = 3800
+
+
+async def _send_explanation(chat_id: int, explanation) -> None:
+    """Render a PageExplanation as up to three Telegram messages: summary,
+    vocabulary, expressions. Splits a section across messages if it would
+    exceed Telegram's 4096-char text limit."""
+    summary = (explanation.summary or "").strip()
+    if summary:
+        await bot.send_message(
+            chat_id,
+            f"<b>📖 Summary</b>\n{html.escape(summary)}",
+            parse_mode="HTML",
+        )
+
+    if explanation.vocabulary:
+        vocab_lines = []
+        for v in explanation.vocabulary:
+            word = html.escape(v.word.strip())
+            reading = html.escape(v.reading.strip())
+            translation = html.escape(v.translation.strip())
+            note = html.escape((v.note or "").strip())
+            line = f"• <b>{word}</b>【{reading}】 — {translation}"
+            if note:
+                line += f" <i>({note})</i>"
+            vocab_lines.append(line)
+        await _send_long_list(chat_id, "<b>📚 Vocabulary</b>", vocab_lines)
+
+    if explanation.expressions:
+        expr_lines = []
+        for e in explanation.expressions:
+            expression = html.escape(e.expression.strip())
+            reading = html.escape(e.reading.strip())
+            explanation_text = html.escape(e.explanation.strip())
+            expr_lines.append(
+                f"• <b>{expression}</b>【{reading}】 — {explanation_text}"
+            )
+        await _send_long_list(chat_id, "<b>💬 Expressions</b>", expr_lines)
+
+
+async def _send_long_list(chat_id: int, header: str, lines: list[str]) -> None:
+    """Send `header` followed by `lines`, splitting into multiple messages if
+    the joined length exceeds Telegram's per-message text budget."""
+    chunks: list[list[str]] = [[]]
+    current_len = len(header) + 1  # +1 for the newline after the header
+    for line in lines:
+        # +1 for the newline separator between lines
+        if current_len + len(line) + 1 > _TELEGRAM_TEXT_BUDGET and chunks[-1]:
+            chunks.append([])
+            current_len = 0
+        chunks[-1].append(line)
+        current_len += len(line) + 1
+    for i, chunk in enumerate(chunks):
+        prefix = header if i == 0 else f"{header} <i>(cont.)</i>"
+        body = "\n".join(chunk)
+        await bot.send_message(
+            chat_id, f"{prefix}\n{body}", parse_mode="HTML",
+        )
+
+
 @dp.message(F.text)
 async def handle_text(message: Message) -> None:
     if not _is_allowed(message.from_user.id, message.from_user.username):
@@ -618,6 +722,17 @@ async def handle_mode_pick(callback: CallbackQuery) -> None:
             pass
         await callback.answer()
         await _run_read_page_flow(
+            mode_session.chat_id, mode_session.image_bytes, mode_session.caption,
+        )
+        return
+
+    if choice == "ep":
+        try:
+            await callback.message.edit_text("🧠 Explaining page...")
+        except Exception:
+            pass
+        await callback.answer()
+        await _run_explain_page_flow(
             mode_session.chat_id, mode_session.image_bytes, mode_session.caption,
         )
         return

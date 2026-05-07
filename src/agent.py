@@ -142,6 +142,66 @@ class StyledPanels(BaseModel):
     items: list[StyledPanelItem]
 
 
+class VocabItem(BaseModel):
+    """One vocabulary entry for the Explain Page workflow."""
+    word: str = Field(
+        description="The word as it appears on the page (kanji or kana)."
+    )
+    reading: str = Field(
+        description="Hiragana reading. Always provide, even for kana-only words."
+    )
+    translation: str = Field(
+        description="Short English gloss — a few words to one short clause."
+    )
+    note: str = Field(
+        default="",
+        description=(
+            "Optional context: nuance, why a learner might miss this, the "
+            "panel/scene it appears in. Empty if no extra context is needed."
+        ),
+    )
+
+
+class ExpressionItem(BaseModel):
+    """One non-obvious expression (idiom, slang, set phrase) for Explain Page."""
+    expression: str = Field(
+        description="The expression as it appears on the page."
+    )
+    reading: str = Field(
+        description="Hiragana reading of the whole expression."
+    )
+    explanation: str = Field(
+        description=(
+            "What the expression means and why it's non-obvious "
+            "(idiomatic, slang, regional, set phrase, etc.) in English."
+        )
+    )
+
+
+class PageExplanation(BaseModel):
+    """Page-level explanation for the Explain Page workflow."""
+    summary: str = Field(
+        description=(
+            "2-4 sentences in English describing what is happening on the page: "
+            "characters, setting, conflict, emotional beat. No spoilers beyond "
+            "what is visible."
+        )
+    )
+    vocabulary: list[VocabItem] = Field(
+        description=(
+            "5-15 difficult words at intermediate (N3/N2) level. Skip N5/N4 "
+            "basics. Skip names of people and places."
+        )
+    )
+    expressions: list[ExpressionItem] = Field(
+        default_factory=list,
+        description=(
+            "0-5 non-obvious expressions (idioms, slang, set phrases). "
+            "Empty list is fine if nothing notable."
+        )
+    )
+
+
 # ---------------------------------------------------------------------------
 # Prompts
 # ---------------------------------------------------------------------------
@@ -294,6 +354,47 @@ If the panel has no dialogue, return an empty string.
 
 Output JSON {{"items": [{{"tts_text": "...", "voice_description_jp": "..."}}, \
 ...]}} — same length and order as the input panels."""
+
+EXPLAIN_PAGE_PROMPT = """\
+You are helping an intermediate Japanese learner (around JLPT N3/N2 level) \
+understand a manga page they just read. Below is the OCR'd dialogue, panel by \
+panel, in reading order.
+
+## PAGE TRANSCRIPT
+{transcript}
+
+Return three things:
+
+1. summary
+   2-4 sentences in English describing what's happening on this page: who is \
+speaking, the setting/situation, the emotional beat, any conflict or shift. \
+Do not invent details that aren't supported by the dialogue. If the page is \
+ambiguous, say so briefly. No spoilers beyond what's on the page.
+
+2. vocabulary
+   A list of 5-15 difficult words from the dialogue. Calibrate for an N3/N2 \
+learner — skip N5/N4 basics (e.g. 食べる, 大きい, 学校, 言う), skip proper \
+nouns (character/place names), skip onomatopoeia unless it's a non-obvious \
+mimetic. Prefer words that are useful to learn (common in adult media) over \
+extreme rarities. For each item:
+   - word: as written on the page (kanji or kana)
+   - reading: hiragana reading (always provide; for kana-only words, repeat the kana)
+   - translation: short English gloss
+   - note: optional one-line context (nuance, why a learner might miss it, what \
+panel it shows up in). Leave empty if not useful.
+
+3. expressions
+   A list of 0-5 less-obvious expressions: idioms, slang, regional speech, \
+set phrases, indirect speech where the literal reading misleads. Skip if \
+nothing on the page qualifies. For each:
+   - expression: as written
+   - reading: hiragana reading of the whole expression
+   - explanation: what it actually means and why a learner who knows the \
+individual words might still miss it.
+
+Write summary, translation, note, and explanation in plain English (no \
+markdown, no HTML tags). Keep individual entries short — these are quick \
+reference notes, not essays."""
 
 
 # ---------------------------------------------------------------------------
@@ -494,6 +595,29 @@ class CardAgent:
             empty = StyledPanelItem(tts_text="", voice_description_jp="")
             items = (items + [empty] * n_panels)[:n_panels]
         return items
+
+    async def explain_page(
+        self,
+        extraction: "CandidateExtraction",
+    ) -> PageExplanation:
+        """Single-shot LLM call: page summary + vocab list + expressions.
+
+        Targeted at intermediate (N3/N2) Japanese learners. Returns a
+        PageExplanation; raises if the LLM call fails.
+        """
+        transcript = self._format_transcript(extraction.ocr_per_panel)
+        prompt = EXPLAIN_PAGE_PROMPT.format(transcript=transcript)
+        logger.info(
+            "explain_page: explaining %d panels in one call",
+            len(extraction.ocr_per_panel),
+        )
+        llm = self._llm.with_structured_output(PageExplanation)
+        result = await llm.ainvoke([HumanMessage(content=prompt)])
+        logger.info(
+            "explain_page: %d vocab, %d expressions",
+            len(result.vocabulary), len(result.expressions),
+        )
+        return result
 
     @staticmethod
     def _format_transcript(ocr_per_panel: list[list[str]]) -> str:
