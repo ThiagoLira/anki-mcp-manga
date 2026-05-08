@@ -52,6 +52,7 @@ class WordCandidate:
     sentence: str       # raw OCR'd Japanese sentence containing the surface
     panel_index: int    # 0-based panel this came from
     panel_image: bytes  # cropped panel image, attached to the eventual card
+    translation: str = ""  # optional pre-baked English gloss (Explain Page path)
 
 
 @dataclass

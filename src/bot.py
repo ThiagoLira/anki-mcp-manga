@@ -208,8 +208,16 @@ def _word_panel_keyboard(
         if cand.panel_index != panel_index:
             continue
         check = "☑" if session.selected[i] else "☐"
+        label = f"{check} {cand.word} ({cand.reading})"
+        if cand.translation:
+            # Telegram inline button text wraps awkwardly past ~50 chars on
+            # mobile; cap the translation so the kanji/reading stay readable.
+            gloss = cand.translation.replace("\n", " ").strip()
+            if len(gloss) > 32:
+                gloss = gloss[:31].rstrip() + "…"
+            label = f"{label} — {gloss}"
         rows.append([InlineKeyboardButton(
-            text=f"{check} {cand.word} ({cand.reading})",
+            text=label,
             callback_data=f"ws:{session_id}:t:{i}",
         )])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -649,15 +657,15 @@ def _explanation_to_extraction(
     """Adapt PageExplanation.{vocabulary, expressions} into a synthetic
     CandidateExtraction so they flow through the existing word-picker /
     flashcard pipeline. Reuses the original page's OCR + panel images."""
-    pairs: list[tuple[str, str]] = []  # (surface, reading)
+    triples: list[tuple[str, str, str]] = []  # (surface, reading, translation)
     for v in explanation.vocabulary or []:
-        pairs.append((v.word.strip(), v.reading.strip()))
+        triples.append((v.word.strip(), v.reading.strip(), v.translation.strip()))
     for e in explanation.expressions or []:
-        pairs.append((e.expression.strip(), e.reading.strip()))
+        triples.append((e.expression.strip(), e.reading.strip(), e.explanation.strip()))
 
     seen: set[str] = set()
     candidates: list[WordCandidate] = []
-    for surface, reading in pairs:
+    for surface, reading, translation in triples:
         if not surface or surface in seen:
             continue
         seen.add(surface)
@@ -675,6 +683,7 @@ def _explanation_to_extraction(
             sentence=sentence,
             panel_index=panel_idx,
             panel_image=panel_image,
+            translation=translation,
         ))
 
     return CandidateExtraction(
