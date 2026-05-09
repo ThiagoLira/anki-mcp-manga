@@ -18,19 +18,22 @@ class Settings(BaseSettings):
     local_llm_model: str = "local"
     local_llm_probe_timeout_s: float = 1.0
 
-    # Irodori-TTS HTTP server (VoiceDesign-only, runs on janus over Tailscale).
-    # Primary TTS path; falls back to the Kokoro-FastAPI service on any timeout /
-    # connect / HTTP error. Set to empty string to disable Irodori entirely
-    # (Kokoro-only).
-    irodori_tts_url: str = "http://100.81.144.115:8200"
+    # Irodori-TTS HTTP server (CUDA pod on jobim/RTX 3090 Ti, reached over
+    # Tailscale). Primary TTS path; falls back to the Kokoro-FastAPI service
+    # on any timeout / connect / HTTP error. Set to empty string to disable
+    # Irodori entirely (Kokoro-only). Was on janus/CPU until 2026-05-09 — if
+    # you see the old 100.81.144.115:8200 in logs, the bot is running pre-
+    # migration code.
+    irodori_tts_url: str = "http://100.86.254.13:8200"
     irodori_tts_timeout_s: float = 90.0
 
-    # Kokoro-FastAPI service (CPU pod on teagolab-1, k8s LoadBalancer at 8880).
+    # Kokoro-FastAPI service (GPU pod on jobim, k8s LoadBalancer at 8880).
     # Fallback path when Irodori is unreachable. Replaces the previous
     # in-process kokoro-onnx + misaki[ja] dependency, dropping ~325 MB of
     # baked-in model weights and the espeak-ng/cmake build deps. Voice prefix
     # `jf_` = Japanese female; pick another voice (e.g. `jm_kumo`) by setting
-    # KOKORO_TTS_VOICE.
+    # KOKORO_TTS_VOICE. The teagolab-1 IP still works because k3s' klipper-lb
+    # binds the LB port on every node.
     kokoro_tts_url: str = "http://100.102.150.83:8880"
     kokoro_tts_timeout_s: float = 30.0
     kokoro_tts_voice: str = "jf_alpha"
