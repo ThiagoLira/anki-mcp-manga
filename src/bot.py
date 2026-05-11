@@ -113,7 +113,7 @@ pending_word_selections: dict[str, WordSelectionSession] = {}
 
 @dataclass
 class ModeSession:
-    """Holds an uploaded image while the user picks a workflow (flashcards / read page)."""
+    """Holds an uploaded image while the user picks a workflow (read page / explain page)."""
     image_bytes: bytes
     caption: str
     chat_id: int
@@ -185,13 +185,8 @@ def _bulk_keyboard(session_id: str) -> InlineKeyboardMarkup:
 
 def _mode_picker_keyboard(session_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="📚 Create flashcards", callback_data=f"mode:{session_id}:fc"),
-            InlineKeyboardButton(text="🔊 Read page", callback_data=f"mode:{session_id}:rp"),
-        ],
-        [
-            InlineKeyboardButton(text="🧠 Explain page", callback_data=f"mode:{session_id}:ep"),
-        ],
+        [InlineKeyboardButton(text="🔊 Read page", callback_data=f"mode:{session_id}:rp")],
+        [InlineKeyboardButton(text="🧠 Explain page", callback_data=f"mode:{session_id}:ep")],
     ])
 
 
@@ -202,24 +197,25 @@ def _mode_picker_keyboard(session_id: str) -> InlineKeyboardMarkup:
 def _word_panel_keyboard(
     session_id: str, session: WordSelectionSession, panel_index: int,
 ) -> InlineKeyboardMarkup:
-    """Toggle button per candidate that lives in the given panel."""
+    """Per-candidate row: toggle button (left) + Explain button (right)."""
     rows = []
     for i, cand in enumerate(session.extraction.candidates):
         if cand.panel_index != panel_index:
             continue
         check = "☑" if session.selected[i] else "☐"
         label = f"{check} {cand.word} ({cand.reading})"
-        if cand.translation:
-            # Telegram inline button text wraps awkwardly past ~50 chars on
-            # mobile; cap the translation so the kanji/reading stay readable.
-            gloss = cand.translation.replace("\n", " ").strip()
-            if len(gloss) > 32:
-                gloss = gloss[:31].rstrip() + "…"
-            label = f"{label} — {gloss}"
-        rows.append([InlineKeyboardButton(
-            text=label,
-            callback_data=f"ws:{session_id}:t:{i}",
-        )])
+        if len(label) > 60:
+            label = label[:59].rstrip() + "…"
+        rows.append([
+            InlineKeyboardButton(
+                text=label,
+                callback_data=f"ws:{session_id}:t:{i}",
+            ),
+            InlineKeyboardButton(
+                text="💬 Explain",
+                callback_data=f"ws:{session_id}:ex:{i}",
+            ),
+        ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -444,33 +440,6 @@ async def handle_photo(message: Message) -> None:
     )
 
 
-async def _run_flashcard_flow(chat_id: int, image_bytes: bytes, caption: str) -> None:
-    """Existing pipeline: detect panels + OCR, then show the word-picker UI."""
-    processing = await bot.send_message(chat_id, "Detecting panels and extracting words...")
-    try:
-        async with agent_lock:
-            extraction = await agent.extract_candidates(image_bytes)
-    except Exception as e:
-        logger.exception("Word extraction failed")
-        await processing.delete()
-        await bot.send_message(chat_id, f"Extraction failed: {e}")
-        return
-    await processing.delete()
-
-    if not extraction.candidates:
-        await bot.send_message(chat_id, "No interesting vocabulary found on this page.")
-        return
-
-    session_id = _new_session_id()
-    session = WordSelectionSession(
-        extraction=extraction,
-        chat_id=chat_id,
-        caption=caption,
-    )
-    pending_word_selections[session_id] = session
-    await _send_word_picker(chat_id, session_id, session)
-
-
 async def _run_read_page_flow(chat_id: int, image_bytes: bytes, caption: str) -> None:
     """Read Page pipeline: detect panels + OCR, style each panel, send image + TTS audio."""
     processing = await bot.send_message(chat_id, "Detecting panels and OCRing dialogue...")
@@ -595,7 +564,7 @@ async def _run_explain_page_flow(chat_id: int, image_bytes: bytes, caption: str)
         return
 
     await processing.delete()
-    await _send_summary(chat_id, explanation.summary)
+    await _send_explanation(chat_id, explanation)
 
     synthetic = _explanation_to_extraction(explanation, extraction)
     if not synthetic.candidates:
@@ -611,15 +580,76 @@ async def _run_explain_page_flow(chat_id: int, image_bytes: bytes, caption: str)
     await _send_word_picker(chat_id, session_id, session)
 
 
-async def _send_summary(chat_id: int, summary: str) -> None:
+TELEGRAM_MSG_LIMIT = 4096
+
+
+async def _send_explanation(chat_id: int, explanation) -> None:
+    """Render the full PageExplanation (summary + vocab + expressions) into a
+    single self-contained message — splitting by section only if Telegram's
+    4096-char limit would be exceeded."""
+    summary_block = _format_summary_block(explanation.summary)
+    vocab_block = _format_vocab_block(explanation.vocabulary or [])
+    expr_block = _format_expressions_block(explanation.expressions or [])
+
+    blocks = [b for b in (summary_block, vocab_block, expr_block) if b]
+    if not blocks:
+        return
+
+    combined = "\n\n".join(blocks)
+    if len(combined) <= TELEGRAM_MSG_LIMIT:
+        await bot.send_message(chat_id, combined, parse_mode="HTML")
+        return
+
+    for block in blocks:
+        await bot.send_message(chat_id, block, parse_mode="HTML")
+
+
+def _format_summary_block(summary: str) -> str:
     summary = (summary or "").strip()
     if not summary:
-        return
-    await bot.send_message(
-        chat_id,
-        f"<b>📖 Summary</b>\n{html.escape(summary)}",
-        parse_mode="HTML",
-    )
+        return ""
+    return f"<b>📖 Summary</b>\n{html.escape(summary)}"
+
+
+def _format_vocab_block(vocabulary: list) -> str:
+    lines: list[str] = []
+    for v in vocabulary:
+        word = html.escape((v.word or "").strip())
+        reading = html.escape((v.reading or "").strip())
+        gloss = html.escape((v.translation or "").strip())
+        note = html.escape((v.note or "").strip())
+        if not word:
+            continue
+        header = f"• <b>{word}</b>"
+        if reading and reading != word:
+            header += f" ({reading})"
+        if gloss:
+            header += f" — {gloss}"
+        lines.append(header)
+        if note:
+            lines.append(f"   <i>{note}</i>")
+    if not lines:
+        return ""
+    return "<b>📚 Vocabulary</b>\n" + "\n".join(lines)
+
+
+def _format_expressions_block(expressions: list) -> str:
+    lines: list[str] = []
+    for e in expressions:
+        expr = html.escape((e.expression or "").strip())
+        reading = html.escape((e.reading or "").strip())
+        explanation_text = html.escape((e.explanation or "").strip())
+        if not expr:
+            continue
+        header = f"• <b>{expr}</b>"
+        if reading and reading != expr:
+            header += f" ({reading})"
+        lines.append(header)
+        if explanation_text:
+            lines.append(f"   {explanation_text}")
+    if not lines:
+        return ""
+    return "<b>💡 Expressions</b>\n" + "\n".join(lines)
 
 
 # Kanji range for the okurigana-stripping fallback in _match_panel_for_surface.
@@ -745,17 +775,6 @@ async def handle_mode_pick(callback: CallbackQuery) -> None:
         await callback.message.edit_reply_markup(reply_markup=None)
     except Exception:
         pass
-
-    if choice == "fc":
-        try:
-            await callback.message.edit_text("📚 Creating flashcards...")
-        except Exception:
-            pass
-        await callback.answer()
-        await _run_flashcard_flow(
-            mode_session.chat_id, mode_session.image_bytes, mode_session.caption,
-        )
-        return
 
     if choice == "rp":
         try:
@@ -1028,7 +1047,82 @@ async def handle_word_selection(callback: CallbackQuery) -> None:
         await _send_card_previews(session.chat_id, review_session_id, review_session)
         return
 
+    if action == "ex":
+        if len(parts) != 4:
+            await callback.answer("Invalid callback data.")
+            return
+        idx = int(parts[3])
+        if idx < 0 or idx >= len(session.extraction.candidates):
+            await callback.answer("Invalid index.")
+            return
+        await callback.answer()
+        await _run_word_explain(session, idx)
+        return
+
     await callback.answer("Unknown action.")
+
+
+async def _run_word_explain(session: WordSelectionSession, idx: int) -> None:
+    """Generate a simple-Japanese explanation of one word + narrator TTS, then
+    send it back as a voice note. Does not mutate the picker session."""
+    cand = session.extraction.candidates[idx]
+    status = await bot.send_message(
+        session.chat_id, f"🤔 Explaining 「{cand.word}」…",
+    )
+    try:
+        async with agent_lock:
+            explanation = await agent.explain_word(
+                cand, session.extraction.ocr_per_panel,
+            )
+    except Exception as e:
+        logger.exception("explain_word LLM call failed")
+        try:
+            await status.edit_text(f"Explain failed for 「{cand.word}」: {e}")
+        except Exception:
+            pass
+        return
+
+    tts_text = (explanation.tts_text or "").strip()
+    if not tts_text:
+        try:
+            await status.edit_text(f"Explain returned empty text for 「{cand.word}」.")
+        except Exception:
+            pass
+        return
+
+    try:
+        from .tts import generate_tts
+        audio_data = await asyncio.to_thread(
+            generate_tts,
+            tts_text,
+            caption=(explanation.voice_description_jp or "").strip() or None,
+        )
+    except Exception as e:
+        logger.exception("explain_word TTS failed")
+        try:
+            await status.edit_text(f"TTS failed for 「{cand.word}」: {e}")
+        except Exception:
+            pass
+        return
+
+    try:
+        await status.delete()
+    except Exception:
+        pass
+
+    voice_file = BufferedInputFile(audio_data, filename=f"explain_{idx}.ogg")
+    caption = f"💬 <b>{html.escape(cand.word)}</b> ({html.escape(cand.reading)})"
+    try:
+        await bot.send_voice(
+            session.chat_id, voice=voice_file, caption=caption, parse_mode="HTML",
+        )
+    except Exception:
+        audio_fallback = BufferedInputFile(audio_data, filename=f"explain_{idx}.wav")
+        await bot.send_audio(
+            session.chat_id, audio=audio_fallback,
+            title=f"Explain {cand.word}", performer="Explain",
+            caption=caption, parse_mode="HTML",
+        )
 
 
 async def main() -> None:

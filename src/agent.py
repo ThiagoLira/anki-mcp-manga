@@ -15,12 +15,9 @@ from pydantic import BaseModel, Field
 from .config import settings
 
 if TYPE_CHECKING:
-    from .panel_detector import PageAnalysis
-    from .word_extractor import CandidateExtraction
+    from .word_extractor import CandidateExtraction, WordCandidate
 
 logger = logging.getLogger(__name__)
-
-MULTI_PANEL_THRESHOLD = 5
 
 
 # ---------------------------------------------------------------------------
@@ -56,29 +53,6 @@ class AgentResult:
 # ---------------------------------------------------------------------------
 # Structured output schemas
 # ---------------------------------------------------------------------------
-
-class MangaProposal(BaseModel):
-    """A proposed manga vocabulary flashcard."""
-    word: str = Field(description="The bare vocabulary word (e.g. 規則)")
-    reading: str = Field(description="Hiragana reading of the word (e.g. きそく)")
-    sentence: str = Field(
-        description="Full Japanese sentence with target word in <b> tags "
-        '(e.g. "<b>規則</b>を守れ")'
-    )
-    translation: str = Field(
-        description="Full sentence translation with translated word in <b> tags "
-        '(e.g. "Follow the <b>rules</b>")'
-    )
-    panel_number: int | None = Field(
-        None, description="0-based panel index matching the ①②③ labels"
-    )
-
-
-class MangaExtraction(BaseModel):
-    """Vocabulary extracted from a manga page or panel."""
-    summary: str = Field(description="Brief transcription and narrative summary")
-    cards: list[MangaProposal] = Field(description="Proposed vocabulary cards")
-
 
 class KanjiProposal(BaseModel):
     """A proposed kanji/vocab flashcard."""
@@ -202,60 +176,26 @@ class PageExplanation(BaseModel):
     )
 
 
+class WordExplanation(BaseModel):
+    """Per-word in-scene explanation for the Explain button on the picker."""
+    tts_text: str = Field(
+        description=(
+            "2-4 sentences in simple Japanese (around JLPT N4) explaining the "
+            "word's meaning and tying it to what is happening on the current "
+            "manga panel. Used as TTS input."
+        )
+    )
+    voice_description_jp: str = Field(
+        description=(
+            "Short Japanese caption for a clear, neutral narrator voice. "
+            "Used as the VoiceDesign caption."
+        )
+    )
+
+
 # ---------------------------------------------------------------------------
 # Prompts
 # ---------------------------------------------------------------------------
-
-MANGA_PROMPT = """\
-You are a Japanese language study assistant that creates Anki flashcards \
-from manga pages.
-
-When panels are detected, the image has panels numbered ①②③... in manga \
-reading order (right-to-left, top-to-bottom).
-
-Follow this two-pass process:
-1. **Transcribe first**: Read ALL dialogue, referencing panel numbers \
-①②③... to establish full context and reading order.
-2. **Create cards**: Extract interesting vocabulary at or above JLPT N4 level. \
-Skip basic N5/N4 words (e.g. 食べる, 大きい, 学校) — the user already knows those.
-
-For each card, provide:
-- `word`: the bare vocabulary word
-- `reading`: hiragana reading (e.g. きそく for 規則)
-- `sentence`: full Japanese sentence with target word in <b>bold</b>
-- `translation`: full sentence translation with translated word in <b>bold</b>
-- `panel_number`: 0-based index matching the ①②③ labels (when panels are visible)
-
-Write a brief `summary` covering transcription and narrative context.
-Respond in English."""
-
-SUMMARY_PROMPT = """\
-You are a Japanese language expert. The image shows a manga page with panels \
-numbered ①②③... in reading order (right-to-left, top-to-bottom).
-
-Provide a concise summary:
-1. Transcribe ALL dialogue per panel.
-2. Summarize the narrative: who speaks, what happens, emotional context.
-
-This will be used as context for per-panel vocabulary extraction."""
-
-PER_PANEL_PROMPT = """\
-You are a Japanese language study assistant that creates Anki flashcards.
-
-Extract interesting vocabulary from this single manga panel. \
-Skip basic JLPT N5/N4 words — the user already knows those. Focus on N3+ vocabulary.
-
-For each card, provide:
-- `word`: the bare vocabulary word
-- `reading`: hiragana reading
-- `sentence`: full Japanese sentence with target word in <b>bold</b>
-- `translation`: full sentence translation with translated word in <b>bold</b>
-
-Do NOT set panel_number — the image is already the correct panel.
-Use the page context below to understand implied subjects or references.
-
-## Page context
-{summary}"""
 
 TEXT_PROMPT = """\
 You are a Japanese language study assistant that creates Anki flashcards.
@@ -395,6 +335,43 @@ individual words might still miss it.
 Write summary, translation, note, and explanation in plain English (no \
 markdown, no HTML tags). Keep individual entries short — these are quick \
 reference notes, not essays."""
+
+EXPLAIN_WORD_PROMPT = """\
+You are a Japanese narrator helping an intermediate learner understand one \
+word from a manga page they just read. The audio is for listening practice, \
+so the explanation must be in clear, simple Japanese — never English.
+
+## TARGET WORD
+{word} ({reading})
+
+## CURRENT PANEL DIALOGUE
+{panel_dialogue}
+
+## FULL PAGE TRANSCRIPT (context)
+{transcript}
+
+Return two fields:
+
+1. tts_text
+   2-4 short sentences in plain Japanese, calibrated to JLPT N4 vocabulary \
+and grammar. Do NOT use English. Avoid katakana loanwords when defining the \
+word (use native Japanese paraphrases instead). Structure:
+   a. A simple definition of {word} in Japanese.
+   b. A tiny in-context paraphrase or example.
+   c. One sentence tying the word to what is happening in the current panel \
+on this manga page.
+   Use minimal emojis — at most one or two from the set ⏸️ (pause), 🐢 (slow), \
+⏩ (fast), 📢 (loud), 👂 (whisper). Do NOT use emotion emojis: this is a \
+narrator, not a character. If unsure, use none.
+   No HTML tags. No markdown.
+
+2. voice_description_jp
+   A short Japanese caption for a clear, neutral narrator voice (no \
+character voicing, no acting). Under 80 characters, ending with \
+「読み上げてください。」 or 「解説してください。」.
+   Examples:
+   - 「明瞭で落ち着いた中性的なナレーターの声で、はっきりと優しく解説してください。」
+   - 「丁寧でクリアな解説者の声で、ゆっくりと分かりやすく読み上げてください。」"""
 
 
 # ---------------------------------------------------------------------------
@@ -619,6 +596,31 @@ class CardAgent:
         )
         return result
 
+    async def explain_word(
+        self,
+        candidate: "WordCandidate",
+        ocr_per_panel: list[list[str]],
+    ) -> WordExplanation:
+        """Single LLM call: simple-Japanese in-scene explanation of one word."""
+        transcript = self._format_transcript(ocr_per_panel)
+        panel_dialogue = "(no dialogue)"
+        if 0 <= candidate.panel_index < len(ocr_per_panel):
+            panel_lines = ocr_per_panel[candidate.panel_index]
+            if panel_lines:
+                panel_dialogue = " / ".join(panel_lines)
+        prompt = EXPLAIN_WORD_PROMPT.format(
+            word=candidate.word,
+            reading=candidate.reading,
+            panel_dialogue=panel_dialogue,
+            transcript=transcript,
+        )
+        logger.info(
+            "explain_word: word=%s reading=%s panel=%d",
+            candidate.word, candidate.reading, candidate.panel_index,
+        )
+        llm = self._llm.with_structured_output(WordExplanation)
+        return await llm.ainvoke([HumanMessage(content=prompt)])
+
     @staticmethod
     def _format_transcript(ocr_per_panel: list[list[str]]) -> str:
         parts = []
@@ -630,26 +632,6 @@ class CardAgent:
     @staticmethod
     def _bold(sentence: str, surface: str) -> str:
         return re.sub(re.escape(surface), f"<b>{surface}</b>", sentence, count=1)
-
-    async def process_image(
-        self,
-        caption: str,
-        image_bytes: bytes,
-        page_analysis: PageAnalysis | None = None,
-    ) -> AgentResult:
-        """Process a manga image and extract vocabulary cards."""
-        n_panels = len(page_analysis.panels) if page_analysis else 0
-        logger.info(
-            "process_image: caption=%d chars, image=%d bytes, panels=%d",
-            len(caption), len(image_bytes), n_panels,
-        )
-
-        if page_analysis and n_panels >= MULTI_PANEL_THRESHOLD:
-            logger.info("Using multi-panel path (>= %d panels)", MULTI_PANEL_THRESHOLD)
-            return await self._multi_panel(caption, image_bytes, page_analysis)
-
-        logger.info("Using single-pass path")
-        return await self._single_pass(caption, image_bytes, page_analysis)
 
     async def process_text(self, text: str) -> AgentResult:
         """Handle a text-only message (kanji cards, questions)."""
@@ -671,116 +653,3 @@ class CardAgent:
             for c in result.kanji_cards
         ]
         return AgentResult(text=result.response, pending_cards=cards)
-
-    # --- Private: processing paths ---
-
-    async def _single_pass(
-        self,
-        caption: str,
-        image_bytes: bytes,
-        page_analysis: PageAnalysis | None,
-    ) -> AgentResult:
-        """Single LLM call for a full page (<= threshold panels)."""
-        if page_analysis:
-            llm_image = page_analysis.annotated_image
-            panels = {i: p.image_bytes for i, p in enumerate(page_analysis.panels)}
-        else:
-            llm_image = image_bytes
-            panels = {}
-
-        extraction = await self._extract_manga(llm_image, caption, MANGA_PROMPT)
-        cards = self._build_manga_cards(extraction, panels, fallback_image=image_bytes)
-        logger.info("single_pass complete: %d cards", len(cards))
-        return AgentResult(text=extraction.summary, pending_cards=cards)
-
-    async def _multi_panel(
-        self,
-        caption: str,
-        image_bytes: bytes,
-        page_analysis: PageAnalysis,
-    ) -> AgentResult:
-        """Summary + per-panel extraction for pages with many panels."""
-        # Step 1: summarise the full page
-        summary = await self._summarize_page(page_analysis.annotated_image, caption)
-        logger.info("Page summary:\n%s", summary)
-
-        # Step 2: extract per panel, tracking seen words to avoid duplicates
-        all_cards: list[PendingCard] = []
-        panel_texts: list[str] = []
-        seen_words: set[str] = set()
-        base_prompt = PER_PANEL_PROMPT.format(summary=summary)
-
-        for i, panel in enumerate(page_analysis.panels):
-            logger.info("Extracting panel %d/%d", i + 1, len(page_analysis.panels))
-            if seen_words:
-                skip_line = "\n\nAlready extracted (do NOT repeat): " + ", ".join(sorted(seen_words))
-                prompt = base_prompt + skip_line
-            else:
-                prompt = base_prompt
-            extraction = await self._extract_manga(
-                panel.image_bytes,
-                "Extract vocabulary from this panel and propose cards.",
-                prompt,
-            )
-            cards = self._build_manga_cards(extraction, {}, fallback_image=panel.image_bytes)
-            all_cards.extend(cards)
-            panel_texts.append(extraction.summary)
-            seen_words.update(c.word for c in cards)
-
-        text = (
-            f"Processed {len(page_analysis.panels)} panels.\n\n"
-            + "\n\n".join(panel_texts)
-        )
-        logger.info("multi_panel complete: %d cards total", len(all_cards))
-        return AgentResult(text=text, pending_cards=all_cards)
-
-    # --- Private: LLM calls ---
-
-    async def _extract_manga(
-        self, image: bytes, user_text: str, system_prompt: str,
-    ) -> MangaExtraction:
-        """Send image + text to LLM and get structured manga extraction."""
-        llm = self._llm.with_structured_output(MangaExtraction)
-        result = await llm.ainvoke([
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=_image_content(image, user_text)),
-        ])
-        words = [c.word for c in result.cards]
-        logger.info("extract_manga: %d cards [%s]", len(result.cards), ", ".join(words))
-        return result
-
-    async def _summarize_page(self, annotated_image: bytes, caption: str) -> str:
-        """Get a narrative summary of the full annotated page."""
-        result = await self._llm.ainvoke([
-            SystemMessage(content=SUMMARY_PROMPT),
-            HumanMessage(content=_image_content(annotated_image, caption)),
-        ])
-        return result.content
-
-    # --- Private: card building ---
-
-    @staticmethod
-    def _build_manga_cards(
-        extraction: MangaExtraction,
-        panels: dict[int, bytes],
-        fallback_image: bytes,
-    ) -> list[PendingCard]:
-        """Convert structured extraction into PendingCards with correct images."""
-        cards: list[PendingCard] = []
-        for proposal in extraction.cards:
-            pn = proposal.panel_number
-            if panels and pn is not None and pn in panels:
-                image = panels[pn]
-                logger.info("  card '%s': using panel %d image", proposal.word, pn)
-            else:
-                image = fallback_image
-                logger.info("  card '%s': using fallback image", proposal.word)
-            cards.append(PendingCard(
-                card_type="manga",
-                word=proposal.word,
-                reading=proposal.reading,
-                sentence=proposal.sentence,
-                translation=proposal.translation,
-                image_data=image,
-            ))
-        return cards
