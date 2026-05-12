@@ -8,13 +8,16 @@ class Settings(BaseSettings):
     openrouter_api_key: str
     openrouter_model: str = "anthropic/claude-sonnet-4"
 
-    # Local LLM (llama-server pod on the janus k3s agent node, reached over
-    # Tailscale). Probed at agent init; if reachable, used in preference to
-    # OpenRouter. The pod exposes containerPort 8080 via hostPort 9080 — port
-    # 8080 on every node IP is claimed cluster-wide by the anki-sync-external
-    # LoadBalancer Service, so we picked 9080 for llama. Override per-host via
-    # LOCAL_LLM_URL env var.
-    local_llm_url: str = "http://100.81.144.115:9080/v1"
+    # Local LLM (llama-server-mtp-cuda pod on jobim/RTX 3090 Ti, reached
+    # over Tailscale). Probed at agent init; if reachable, used in
+    # preference to OpenRouter. Points at the MTP speculative-decoding
+    # build (Qwen3.6-27B UD-Q4_K_XL, ~35 tok/s) rather than the slower
+    # Vulkan janus pod (~15 tok/s on Q8_0). Both expose containerPort
+    # 8080 via hostPort 9090 — port 8080 on every node IP is claimed
+    # cluster-wide by the anki-sync-external LoadBalancer Service, and
+    # 9080 was the original llama-server port; 9090 is the MTP variant.
+    # Override per-host via LOCAL_LLM_URL env var.
+    local_llm_url: str = "http://100.86.254.13:9090/v1"
     local_llm_model: str = "local"
     local_llm_probe_timeout_s: float = 1.0
 
