@@ -5,10 +5,12 @@ import base64
 import logging
 import re
 import unicodedata
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.output_parsers import JsonOutputParser
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
@@ -472,6 +474,15 @@ class CardAgent:
         logger.info("extract_candidates: image=%d bytes", len(image_bytes))
         return await asyncio.to_thread(self._word_extractor.extract, image_bytes)
 
+    def warmup(self) -> None:
+        """Synchronously load the word-extraction pipeline so the first user
+        request doesn't pay the ~13s manga-ocr + ONNX panel detector cold tax.
+        Safe to call multiple times — subsequent calls are no-ops."""
+        if self._word_extractor is None:
+            from .word_extractor import WordExtractor
+            self._word_extractor = WordExtractor()
+        self._word_extractor._ensure_loaded()
+
     async def generate_cards(
         self,
         extraction: "CandidateExtraction",
@@ -573,28 +584,37 @@ class CardAgent:
             items = (items + [empty] * n_panels)[:n_panels]
         return items
 
-    async def explain_page(
+    async def astream_explain_page(
         self,
         extraction: "CandidateExtraction",
-    ) -> PageExplanation:
-        """Single-shot LLM call: page summary + vocab list + expressions.
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Stream the page summary + vocab + expressions as partial JSON.
 
-        Targeted at intermediate (N3/N2) Japanese learners. Returns a
-        PageExplanation; raises if the LLM call fails.
+        Yields a sequence of partial dicts (each one a superset of the last),
+        where the `summary` field tends to be populated first so the caller
+        can display it before vocab/expressions arrive. The final yield is the
+        complete dict, suitable for `PageExplanation(**d)` validation.
+
+        Uses raw JSON output (rather than tool-calling `with_structured_output`)
+        because tool-call argument streaming is buffered until completion in
+        langchain-openai 1.x — defeating the whole point of streaming.
         """
         transcript = self._format_transcript(extraction.ocr_per_panel)
-        prompt = EXPLAIN_PAGE_PROMPT.format(transcript=transcript)
+        parser = JsonOutputParser(pydantic_object=PageExplanation)
+        prompt = (
+            EXPLAIN_PAGE_PROMPT.format(transcript=transcript)
+            + "\n\nReturn ONLY valid JSON matching the schema below — "
+            "no markdown fences, no commentary.\n\n"
+            + parser.get_format_instructions()
+        )
         logger.info(
-            "explain_page: explaining %d panels in one call",
+            "explain_page: streaming explanation for %d panels",
             len(extraction.ocr_per_panel),
         )
-        llm = self._llm.with_structured_output(PageExplanation)
-        result = await llm.ainvoke([HumanMessage(content=prompt)])
-        logger.info(
-            "explain_page: %d vocab, %d expressions",
-            len(result.vocabulary), len(result.expressions),
-        )
-        return result
+        chain = self._llm | parser
+        async for partial in chain.astream([HumanMessage(content=prompt)]):
+            if isinstance(partial, dict):
+                yield partial
 
     async def explain_word(
         self,

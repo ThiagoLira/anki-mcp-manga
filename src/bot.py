@@ -16,7 +16,7 @@ from aiogram.types import (
     Message,
 )
 
-from .agent import CardAgent, PendingCard
+from .agent import CardAgent, PageExplanation, PendingCard
 from .anki_manager import AnkiManager
 from .config import settings
 from .sync_manager import SyncManager
@@ -531,9 +531,10 @@ async def _run_read_page_flow(chat_id: int, image_bytes: bytes, caption: str) ->
 
 
 async def _run_explain_page_flow(chat_id: int, image_bytes: bytes, caption: str) -> None:
-    """Explain Page pipeline: detect panels + OCR, ask the LLM for a summary
-    + vocab + expressions, then surface vocab/expressions through the
-    existing word-picker UI so the user can build flashcards from them."""
+    """Explain Page pipeline: detect panels + OCR, stream the LLM summary as
+    soon as tokens arrive, then send vocab + expressions once the stream
+    completes, and finally surface vocab/expressions through the existing
+    word-picker UI so the user can build flashcards from them."""
     processing = await bot.send_message(chat_id, "Detecting panels and OCRing dialogue...")
     try:
         async with agent_lock:
@@ -554,17 +555,102 @@ async def _run_explain_page_flow(chat_id: int, image_bytes: bytes, caption: str)
     except Exception:
         pass
 
+    # Stream the summary into a dedicated message as soon as the LLM emits it.
+    # Throttle edits to avoid Telegram rate limits (429 on too-frequent edits).
+    SUMMARY_EDIT_INTERVAL = 1.5
+    summary_msg = None
+    last_summary_rendered = ""
+    last_edit_time = 0.0
+    final_partial: dict | None = None
+
     try:
         async with agent_lock:
-            explanation = await agent.explain_page(extraction)
+            async for partial in agent.astream_explain_page(extraction):
+                final_partial = partial
+                summary = (partial.get("summary") or "").strip()
+                if not summary:
+                    continue
+                now = time.monotonic()
+                if summary_msg is None:
+                    # First time we have summary content — promote into its own
+                    # message and drop the "Asking..." status.
+                    summary_msg = await bot.send_message(
+                        chat_id, _format_summary_block(summary), parse_mode="HTML",
+                    )
+                    last_summary_rendered = summary
+                    last_edit_time = now
+                    try:
+                        await processing.delete()
+                    except Exception:
+                        pass
+                    processing = None
+                elif (
+                    summary != last_summary_rendered
+                    and now - last_edit_time >= SUMMARY_EDIT_INTERVAL
+                ):
+                    try:
+                        await bot.edit_message_text(
+                            chat_id=chat_id, message_id=summary_msg.message_id,
+                            text=_format_summary_block(summary), parse_mode="HTML",
+                        )
+                        last_summary_rendered = summary
+                        last_edit_time = now
+                    except Exception:
+                        pass  # rate-limited or unchanged — try again next chunk
     except Exception as e:
         logger.exception("Explain page LLM call failed")
-        await processing.delete()
+        if processing is not None:
+            try:
+                await processing.delete()
+            except Exception:
+                pass
         await bot.send_message(chat_id, f"Explanation failed: {e}")
         return
 
-    await processing.delete()
-    await _send_explanation(chat_id, explanation)
+    if processing is not None:
+        try:
+            await processing.delete()
+        except Exception:
+            pass
+
+    if final_partial is None:
+        await bot.send_message(chat_id, "LLM returned no content.")
+        return
+
+    try:
+        explanation = PageExplanation(**final_partial)
+    except Exception as e:
+        logger.exception("Failed to validate final PageExplanation: %r", final_partial)
+        await bot.send_message(chat_id, f"Couldn't parse explanation: {e}")
+        return
+
+    logger.info(
+        "explain_page: %d vocab, %d expressions",
+        len(explanation.vocabulary), len(explanation.expressions),
+    )
+
+    # Make sure the last summary state landed even if the throttle dropped it.
+    final_summary = (explanation.summary or "").strip()
+    if summary_msg is not None and final_summary and final_summary != last_summary_rendered:
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id, message_id=summary_msg.message_id,
+                text=_format_summary_block(final_summary), parse_mode="HTML",
+            )
+        except Exception:
+            pass
+    elif summary_msg is None and final_summary:
+        # Stream didn't yield any partial — send the summary as a single message.
+        await bot.send_message(
+            chat_id, _format_summary_block(final_summary), parse_mode="HTML",
+        )
+
+    vocab_block = _format_vocab_block(explanation.vocabulary or [])
+    if vocab_block:
+        await bot.send_message(chat_id, vocab_block, parse_mode="HTML")
+    expr_block = _format_expressions_block(explanation.expressions or [])
+    if expr_block:
+        await bot.send_message(chat_id, expr_block, parse_mode="HTML")
 
     synthetic = _explanation_to_extraction(explanation, extraction)
     if not synthetic.candidates:
@@ -578,30 +664,6 @@ async def _run_explain_page_flow(chat_id: int, image_bytes: bytes, caption: str)
     )
     pending_word_selections[session_id] = session
     await _send_word_picker(chat_id, session_id, session)
-
-
-TELEGRAM_MSG_LIMIT = 4096
-
-
-async def _send_explanation(chat_id: int, explanation) -> None:
-    """Render the full PageExplanation (summary + vocab + expressions) into a
-    single self-contained message — splitting by section only if Telegram's
-    4096-char limit would be exceeded."""
-    summary_block = _format_summary_block(explanation.summary)
-    vocab_block = _format_vocab_block(explanation.vocabulary or [])
-    expr_block = _format_expressions_block(explanation.expressions or [])
-
-    blocks = [b for b in (summary_block, vocab_block, expr_block) if b]
-    if not blocks:
-        return
-
-    combined = "\n\n".join(blocks)
-    if len(combined) <= TELEGRAM_MSG_LIMIT:
-        await bot.send_message(chat_id, combined, parse_mode="HTML")
-        return
-
-    for block in blocks:
-        await bot.send_message(chat_id, block, parse_mode="HTML")
 
 
 def _format_summary_block(summary: str) -> str:
@@ -1128,6 +1190,16 @@ async def _run_word_explain(session: WordSelectionSession, idx: int) -> None:
 async def main() -> None:
     logging.basicConfig(level=logging.INFO)
     logger.info("Starting Anki Telegram Bot...")
+
+    t0 = time.monotonic()
+    logger.info("Pre-warming word-extraction pipeline (manga-ocr + ONNX detector)...")
+    try:
+        await asyncio.to_thread(agent.warmup)
+        logger.info("Warmup complete in %.1fs", time.monotonic() - t0)
+    except Exception:
+        # First-request lazy load will still work — just log and keep going.
+        logger.exception("Warmup failed; falling back to lazy load on first request")
+
     try:
         await dp.start_polling(bot)
     finally:
